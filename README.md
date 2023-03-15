@@ -1,2 +1,2 @@
-# EmbeddingAlignment
-Experiments on Embedding Alignment
+# Emb_Exp
+Experiments with Visual and Linguistic Embedding alignment
