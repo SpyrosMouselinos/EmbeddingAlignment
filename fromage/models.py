@@ -175,7 +175,10 @@ class FromageModel(nn.Module):
     super(FromageModel, self).train(mode=mode)
     # Overwrite train() to ensure Frozen models remain frozen.
     if self.args.freeze_lm:
-      self.lm.eval()
+      try:
+        self.lm.eval()
+      except AttributeError:
+        pass
     if self.args.freeze_vm:
       self.visual_model.eval()
 
