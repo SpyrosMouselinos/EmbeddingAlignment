@@ -24,8 +24,8 @@ from fromage import utils
 class FrozenArgs:
   freeze_lm: bool = True
   freeze_vm: bool = True
-  #opt_version: str = 'facebook/opt-6.7b'
-  opt_version: str = 'facebook/opt-125m'
+  opt_version: str = 'facebook/opt-6.7b'
+  #opt_version: str = 'facebook/opt-125m'
   visual_encoder: str = 'openai/clip-vit-large-patch14'
   n_visual_tokens: int = 1
   image_embed_dropout_prob: float = 0.0
@@ -33,6 +33,8 @@ class FrozenArgs:
   shared_emb_dim: Optional[int] = 256
   text_emb_layers: List[int] = [-1]
   retrieval_token_idx: int = 0
+  skip_lm: bool = True
+  fake_emb_dim: int = 4096
 
 
 class FromageModel(nn.Module):
@@ -44,6 +46,8 @@ class FromageModel(nn.Module):
     assert args.text_emb_layers != set(args.text_emb_layers), 'text_emb_layers not unique'
     self.args = args
 
+    skip_lm = args.skip_lm
+    fake_emb_dim = args.fake_emb_dim
     opt_version = args.opt_version
     visual_encoder = args.visual_encoder
     n_visual_tokens = args.n_visual_tokens
@@ -52,26 +56,32 @@ class FromageModel(nn.Module):
 
     self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-    if 'facebook/opt' in opt_version:
-      self.lm = OPTForCausalLM.from_pretrained(opt_version)
+    if not skip_lm:
+      if 'facebook/opt' in opt_version:
+        self.lm = OPTForCausalLM.from_pretrained(opt_version)
+      else:
+        raise NotImplementedError
+
+      self.opt_version = opt_version
+
+      if self.args.freeze_lm:
+        self.lm.eval()
+        print("Freezing the LM.")
+        for param in self.lm.parameters():
+          param.requires_grad = False
+      else:
+        self.lm.train()
+
+
+      self.retrieval_token_idx = args.retrieval_token_idx
+      print(f'Initializing embedding for the retrieval token [RET] (id = {self.retrieval_token_idx}).')
+      self.lm.resize_token_embeddings(len(tokenizer))
+
+      self.input_embeddings = self.lm.get_input_embeddings()
     else:
-      raise NotImplementedError
-
-    self.opt_version = opt_version
-
-    if self.args.freeze_lm:
-      self.lm.eval()
-      print("Freezing the LM.")
-      for param in self.lm.parameters():
-        param.requires_grad = False
-    else:
-      self.lm.train()
-
-    self.retrieval_token_idx = args.retrieval_token_idx
-    print(f'Initializing embedding for the retrieval token [RET] (id = {self.retrieval_token_idx}).')
-    self.lm.resize_token_embeddings(len(tokenizer))
-
-    self.input_embeddings = self.lm.get_input_embeddings()
+      self.lm = None
+      self.retrieval_token_idx = args.retrieval_token_idx
+      self.input_embeddings = None
 
     print("Restoring pretrained weights for the visual model.")
     if 'clip' in visual_encoder:
@@ -94,7 +104,10 @@ class FromageModel(nn.Module):
 
     self.visual_model_name = visual_encoder
 
-    embedding_dim = self.input_embeddings.embedding_dim * self.args.n_visual_tokens
+    if not skip_lm:
+      embedding_dim = self.input_embeddings.embedding_dim * self.args.n_visual_tokens
+    else:
+      embedding_dim = args.fake_emb_dim
     self.text_hidden_fcs = nn.ModuleList([])
     if self.args.shared_emb_dim is None:
       if len(self.args.text_emb_layers) == 1:
