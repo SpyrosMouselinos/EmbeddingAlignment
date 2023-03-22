@@ -124,18 +124,18 @@ class FromageModel(nn.Module):
     else:
       out_dim = self.args.shared_emb_dim
 
-      for layer_idx in self.args.text_emb_layers:
-        if (layer_idx == -1 or layer_idx == self.lm.config.num_hidden_layers) and ('bert' not in opt_version):
-          in_dim = self.lm.config.word_embed_proj_dim
-
-          text_fc = [nn.Linear(in_dim, out_dim), nn.Dropout(self.args.text_embed_dropout_prob)]
-          self.text_hidden_fcs.append(nn.Sequential(*text_fc))
-
-        elif layer_idx < self.lm.config.num_hidden_layers:
-          text_fc = [nn.Linear(self.lm.config.hidden_size, out_dim), nn.Dropout(self.args.text_embed_dropout_prob)]
-          self.text_hidden_fcs.append(nn.Sequential(*text_fc))
-        else:
-          raise ValueError(f'Embedding of layer {layer_idx} was requested but model only has {self.lm.config.num_hidden_layers} layers.')
+      # for layer_idx in self.args.text_emb_layers:
+      #   if (layer_idx == -1 or layer_idx == self.lm.config.num_hidden_layers) and ('bert' not in opt_version):
+      #     in_dim = self.lm.config.word_embed_proj_dim
+      #
+      #     text_fc = [nn.Linear(in_dim, out_dim), nn.Dropout(self.args.text_embed_dropout_prob)]
+      #     self.text_hidden_fcs.append(nn.Sequential(*text_fc))
+      #
+      #   elif layer_idx < self.lm.config.num_hidden_layers:
+      #     text_fc = [nn.Linear(self.lm.config.hidden_size, out_dim), nn.Dropout(self.args.text_embed_dropout_prob)]
+      #     self.text_hidden_fcs.append(nn.Sequential(*text_fc))
+      #   else:
+      #     raise ValueError(f'Embedding of layer {layer_idx} was requested but model only has {self.lm.config.num_hidden_layers} layers.')
 
     self.visual_embeddings = nn.Linear(hidden_size, embedding_dim)
     self.visual_fc = nn.Linear(hidden_size, out_dim)
