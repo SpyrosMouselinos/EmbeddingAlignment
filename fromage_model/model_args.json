@@ -18,7 +18,5 @@
     "input_prompt": "A picture of",
     "add_input_to_ret": true,
     "tunable_prompt_length": 0,
-    "retrieval_token_idx": 50266,
-    "skip_lm": true,
-    "fake_emb_dim": 4096
+    "retrieval_token_idx": 50266
 }
