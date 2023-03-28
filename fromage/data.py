@@ -141,7 +141,7 @@ class CsvDataset(Dataset):
                     max_length=self.max_len)
                 tokens = tokenized_data.input_ids[0]
                 caption_len = tokenized_data.attention_mask[0].sum()
-                return image_path, images, tokens, caption_len
+                return images, tokens, caption_len
 
             except Exception as e:
                 print(f'Error reading {image_path} with caption {caption}: {e}')

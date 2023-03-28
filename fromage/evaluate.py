@@ -48,9 +48,9 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
             all_image_features = []
             all_text_features = []
 
-            for i, (image_paths, images, caption_images, tgt_tokens, token_len) in tqdm.tqdm(enumerate(loader),
-                                                                                             position=0,
-                                                                                             total=len(loader)):
+            for i, (image_paths, images, tgt_tokens, token_len) in tqdm.tqdm(enumerate(loader),
+                                                                             position=0,
+                                                                             total=len(loader)):
                 i = base_progress + i
 
                 if torch.cuda.is_available():
@@ -58,10 +58,7 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
                     token_len = token_len.cuda(args.gpu, non_blocking=True)
                     images = images.cuda()
 
-                if args.precision == 'fp16':
-                    images = images.half()
-                elif args.precision == 'bf16':
-                    images = images.bfloat16()
+                images = images.half()
 
                 for model_mode in model_modes:
                     (model_output, full_labels, last_embedding, _, visual_embs) = model(

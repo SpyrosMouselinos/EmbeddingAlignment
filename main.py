@@ -48,10 +48,10 @@ def parse_args(args):
 
     parser.add_argument('--val-dataset', metavar='DATASET', default='cc3m')
 
-    parser.add_argument('--dataset_dir', default='../datasets/', type=str,
+    parser.add_argument('--dataset_dir', default='./datasets/', type=str,
                         help='Dataset directory containing .tsv files.')
 
-    parser.add_argument('--image-dir', default='..//data/', type=str,
+    parser.add_argument('--image-dir', default='./data/', type=str,
                         help='Dataset directory containing image folders.')
 
     parser.add_argument('--log-base-dir', default='./runs/', type=str,
@@ -75,7 +75,7 @@ def parse_args(args):
     parser.add_argument('--val-steps-per-epoch', default=-1, type=int, metavar='N',
                         help='number of validation steps per epoch.')
 
-    parser.add_argument('-b', '--batch-size', default=180, type=int,
+    parser.add_argument('-b', '--batch-size', default=8, type=int,
                         metavar='N',
                         help='mini-batch size (default: 180), this is the total '
                              'batch size of all GPUs on the current node when '
@@ -359,8 +359,8 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    train_dataset = data.get_dataset(args, 'train', tokenizer)
-    val_dataset = data.get_dataset(args, 'val', tokenizer)
+    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=100)
+    val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=100)
     print(f'Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples.')
 
     if args.distributed:
@@ -382,8 +382,6 @@ def main_worker(gpu, ngpus_per_node, args):
         return
 
     for epoch in range(args.start_epoch, args.epochs):
-        if epoch == 0:
-            evaluate.validate(val_loader, model, tokenizer, criterion, epoch - 1, args)
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
@@ -391,11 +389,13 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler, args)
 
         # evaluate on validation set
-        eval_score = evaluate.validate(val_loader, model, tokenizer, criterion, epoch, args)
+        #eval_score = evaluate.validate(val_loader, model, tokenizer, criterion, epoch, args)
 
         # remember best score and save checkpoint
-        is_best = eval_score > best_score
-        best_score = max(eval_score, best_score)
+        is_best = True
+        best_score = -1
+        #is_best = eval_score > best_score
+        #best_score = max(eval_score, best_score)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
@@ -447,7 +447,8 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
         loss = 0
         mode_start = time.time()
 
-        (model_output, full_labels, last_embedding, _, visual_embs) = model(pixel_values=images, labels=tgt_tokens,
+        (model_output, full_labels, last_embedding, _, visual_embs) = model(pixel_values=images,
+                                                                            labels=tgt_tokens,
                                                                             mode='no_projection')
 
         output = model_output.logits

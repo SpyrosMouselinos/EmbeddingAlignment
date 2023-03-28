@@ -17,14 +17,14 @@ import copy
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 from transformers import OPTForCausalLM, GPT2Tokenizer
 from transformers import CLIPVisionModel, CLIPVisionConfig
-
+from losses import AsymmetricLossOptimized
 from fromage import utils
 
 
 class FrozenArgs:
     freeze_lm: bool = True
     freeze_vm: bool = True
-    opt_version: str = 'facebook/opt-6.7b'
+    opt_version: str = 'facebook/opt-125m'
     visual_encoder: str = 'openai/clip-vit-large-patch14'
     n_visual_tokens: int = 1
     image_embed_dropout_prob: float = 0.0
@@ -32,6 +32,8 @@ class FrozenArgs:
     shared_emb_dim: Optional[int] = 256
     text_emb_layers: List[int] = [-1]
     retrieval_token_idx: int = 0
+    gamma_neg: int = 4
+    gamma_pos: int = 1
 
 
 # class FromageModel(nn.Module):
@@ -483,6 +485,7 @@ class TLTLModel(nn.Module):
         self.lm = None
         del self.lm
         language_hidden_size = self.unembed.weight.size()[1]
+        self.active_vocab_size = self.unembed.weight.size()[0]
         print("[Step 4]: Restoring the VM...\n")
         self.visual_model_name = visual_encoder
         self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder, torch_dtype=torch.float16)
@@ -496,6 +499,9 @@ class TLTLModel(nn.Module):
         self.visual_embeddings = nn.Linear(visual_hidden_size, embedding_dim, bias=True)
         self.post_visual_embeddings_normalization = nn.LayerNorm(normalized_shape=language_hidden_size,
                                                                  elementwise_affine=True)
+        self.gamma_neg = self.args.gamma_neg if self.args.gamma_neg is not None else 4
+        self.gamma_pos = self.args.gamma_pos if self.args.gamma_pos is not None else 1
+        self.loss_fn = AsymmetricLossOptimized(gamma_neg=self.gamma_neg, gamma_pos=self.gamma_pos)
 
     def get_visual_embs(self,
                         pixel_values: torch.FloatTensor,
@@ -524,12 +530,18 @@ class TLTLModel(nn.Module):
         self.visual_embeddings.train()
         self.post_visual_embeddings_normalization.train()
 
+    def calc_loss_(self, x, y):
+        sparse_y = torch.zeros(self.active_vocab_size).scatter_(0, y, torch.ones(self.active_vocab_size)).to(
+            device=self.visual_embeddings.weights.device)
+        loss = self.loss_fn(x, sparse_y)
+        return loss
+
     def forward(self,
-                pixel_values: torch.FloatTensor,
+                images: torch.FloatTensor,
                 labels: torch.LongTensor,
                 mode: str = 'no_projection'):
 
-        visual_embs = self.get_visual_embs(pixel_values, mode)
+        visual_embs = self.get_visual_embs(images, mode)
         batch_size, vis_seq_len, _ = visual_embs.shape  # vis_seq_len = n_visual_tokens
         if labels is not None:
             assert labels.shape[0] == batch_size, (visual_embs.shape, labels.shape)
