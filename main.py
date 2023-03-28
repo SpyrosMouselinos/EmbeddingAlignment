@@ -28,6 +28,8 @@ from fromage import utils
 from fromage import evaluate
 from transformers import AutoTokenizer
 
+from fromage.losses import AsymmetricLossOptimized
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 visual_models = ['openai/clip-vit-large-patch14', 'openai/clip-vit-large-patch14-336']
 llm_models = ['facebook/opt-125m', 'facebook/opt-350m', 'facebook/opt-1.3b',
@@ -38,22 +40,18 @@ best_score = 0
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description='TLTL Trainer')
-    parser.add_argument('--opt-version', default='facebook/opt-125m',
-                        choices=llm_models)
+    parser.add_argument('--opt-version', default='facebook/opt-125m')
     parser.add_argument('--visual-model',
                         default='openai/clip-vit-large-patch14',
                         type=str, help="Visual encoder to use.")
-    parser.add_argument('-d', '--dataset', metavar='DATASET', help='Delimited list of datasets:' +
-                                                                   ' | '.join(datasets), default='cc3m',
-                        type=lambda s: [x for x in s.split(',')])
+    parser.add_argument('-d', '--dataset', metavar='DATASET', default='cc3m')
 
-    parser.add_argument('--val-dataset', metavar='DATASET', default='cc3m',
-                        type=lambda s: [x for x in s.split(',')])
+    parser.add_argument('--val-dataset', metavar='DATASET', default='cc3m')
 
-    parser.add_argument('--dataset_dir', default='datasets', type=str,
+    parser.add_argument('--dataset_dir', default='../datasets/', type=str,
                         help='Dataset directory containing .tsv files.')
 
-    parser.add_argument('--image-dir', default='./data/', type=str,
+    parser.add_argument('--image-dir', default='..//data/', type=str,
                         help='Dataset directory containing image folders.')
 
     parser.add_argument('--log-base-dir', default='./runs/', type=str,
@@ -169,17 +167,24 @@ def parse_args(args):
     parser.add_argument('--dist-backend', default='nccl', type=str,
                         help='distributed backend')
 
-    parser.add_argument('--seed', default=None, type=int,
+    parser.add_argument('--seed', default=1453, type=int,
                         help='seed for initializing training. ')
 
     parser.add_argument('--gpu', default=None, type=int,
                         help='GPU id to use.')
+
+    parser.add_argument('--save_images', default='True', type=str,
+                        help='weather to save images into a folder while iterating or not')
 
     parser.add_argument('--multiprocessing-distributed', action='store_true',
                         help='Use multi-processing distributed training to launch '
                              'N processes per node, which has N GPUs. This is the '
                              'fastest way to use PyTorch for either single node or '
                              'multi node data parallel training')
+    parser.add_argument('--gamma_neg', default=4, type=int,
+                        help='Scale of negative example impact in assymetric entropy loss')
+    parser.add_argument('--gamma_pos', default=1, type=int,
+                        help='Scale of positive example impact in assymetric entropy loss')
 
     return parser.parse_args(args)
 
@@ -273,12 +278,7 @@ def main_worker(gpu, ngpus_per_node, args):
     with open(os.path.join(args.log_dir, 'model_args.json'), 'w') as f:
         json.dump(vars(model_args), f, indent=4)
 
-    model = models.Fromage(tokenizer, model_args)
-    if args.precision == 'fp16':
-        model = model.float()
-    elif args.precision == 'bf16':
-        model = model.bfloat16()
-
+    model = models.TLTLModel(tokenizer, model_args)
     # Print parameters and count of model.
     param_counts_text = utils.get_params_count_str(model)
     with open(os.path.join(args.log_dir, 'param_count.txt'), 'w') as f:
@@ -313,7 +313,9 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model = torch.nn.DataParallel(model).cuda()
 
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    ### LOSS FUNCTION ###
+    # sparse_targets = torch.zeros(50267).scatter_(0, targets, torch.ones(50267)).to('cuda')
+    criterion = AsymmetricLossOptimized(gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos)
     optimizer_cls = torch.optim.AdamW
     print('Using torch.optim.AdamW as the optimizer.')
     optimizer = optimizer_cls(model.parameters(), args.lr,
@@ -322,9 +324,13 @@ def main_worker(gpu, ngpus_per_node, args):
                               eps=1e-8)
 
     """Sets the learning rate to the initial LR decayed by 10 every 5 epochs"""
-    scheduler_steplr = StepLR(optimizer, step_size=args.lr_schedule_step_size * args.steps_per_epoch,
+    scheduler_steplr = StepLR(optimizer,
+                              step_size=args.lr_schedule_step_size * args.steps_per_epoch,
                               gamma=args.lr_schedule_gamma)
-    scheduler = GradualWarmupScheduler(optimizer, multiplier=1.0, total_epoch=args.lr_warmup_steps,
+
+    scheduler = GradualWarmupScheduler(optimizer,
+                                       multiplier=1.0,
+                                       total_epoch=args.lr_warmup_steps,
                                        after_scheduler=scheduler_steplr)
 
     # optionally resume from a checkpoint
@@ -372,7 +378,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
     if args.evaluate:
-        evaluate.validate(val_loader, model, tokenizer, criterion, epoch, args)
+        evaluate.validate(val_loader, model, tokenizer, criterion, -1, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -402,12 +408,11 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best, os.path.join(args.log_dir, 'ckpt'))
 
 
-def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler, args):
+def train(train_loader, model, optimizer, epoch, scheduler, args):
     """Main training loop."""
     ngpus_per_node = torch.cuda.device_count()
     batch_time = utils.AverageMeter('Time', ':6.3f')
     cap_time = utils.AverageMeter('CaptioningTime', ':6.3f')
-    ret_time = utils.AverageMeter('RetrievalTime', ':6.3f')
     data_time = utils.AverageMeter('Data', ':6.3f')
     losses = utils.AverageMeter('Loss', ':.4e')
     ce_losses = utils.AverageMeter('CeLoss', ':.4e')
@@ -416,8 +421,6 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
     cont_losses = utils.AverageMeter('ContLoss', ':.4e')
     top1_caption = utils.AverageMeter('AccCaption@1', ':6.2f')
     top5_caption = utils.AverageMeter('AccCaption@5', ':6.2f')
-    top1_image = utils.AverageMeter('AccImage@1', ':6.2f')
-    top5_image = utils.AverageMeter('AccImage@5', ':6.2f')
 
     writer = SummaryWriter(args.log_dir)
 
@@ -439,84 +442,24 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         if torch.cuda.is_available():
             images = images.cuda(args.gpu, non_blocking=True)
             tgt_tokens = tgt_tokens.cuda(args.gpu, non_blocking=True)
-            token_len = token_len.cuda(args.gpu, non_blocking=True)
 
-        if args.precision == 'fp16':
-            images = images.half()
-        elif args.precision == 'bf16':
-            images = images.bfloat16()
-
-        model_modes = ['captioning', 'retrieval']
+        images = images.half()
         loss = 0
+        mode_start = time.time()
 
-        for model_mode in model_modes:
-            mode_start = time.time()
-            # compute output
-            concat_captions = np.random.uniform(0, 1) < args.concat_captions_prob
-            if not args.concat_for_ret:
-                concat_captions = concat_captions and model_mode == 'captioning'
+        (model_output, full_labels, last_embedding, _, visual_embs) = model(pixel_values=images, labels=tgt_tokens,
+                                                                            mode='no_projection')
 
-            (model_output, full_labels, last_embedding, _, visual_embs) = model(
-                images, tgt_tokens, token_len, mode=model_mode, concat_captions=concat_captions, inference=False)
-            output = model_output.logits
+        output = model_output.logits
+        # Measure captioning accuracy for multi-task models and next-token prediction for retrieval models.
+        acc1, acc5 = utils.accuracy(output[:, :-1, :], full_labels[:, 1:], -100, topk=(1, 5))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
 
-            # Measure captioning accuracy for multi-task models and next-token prediction for retrieval models.
-            if model_mode == 'captioning':
-                acc1, acc5 = utils.accuracy(output[:, :-1, :], full_labels[:, 1:], -100, topk=(1, 5))
-                top1.update(acc1[0], images.size(0))
-                top5.update(acc5[0], images.size(0))
-
-            ce_loss = model_output.loss
-            if model_mode == 'captioning':
-                ce_loss = ce_loss * args.cap_loss_scale
-            elif model_mode == 'retrieval':
-                ce_loss = ce_loss * args.ret_loss_scale
-            else:
-                raise NotImplementedError
-
-            loss += ce_loss
-            ce_losses.update(ce_loss.item(), images.size(0))
-
-            if model_mode == 'retrieval':
-                # Cross replica concat for embeddings.
-                if args.distributed:
-                    all_visual_embs = [torch.zeros_like(visual_embs) for _ in range(dist.get_world_size())]
-                    all_last_embedding = [torch.zeros_like(last_embedding) for _ in range(dist.get_world_size())]
-                    dist.all_gather(all_visual_embs, visual_embs)
-                    dist.all_gather(all_last_embedding, last_embedding)
-                    # Overwrite with embeddings produced on this replace, which have the gradient.
-                    all_visual_embs[dist.get_rank()] = visual_embs
-                    all_last_embedding[dist.get_rank()] = last_embedding
-                    visual_embs = torch.cat(all_visual_embs)
-                    last_embedding = torch.cat(all_last_embedding)
-
-                    start_idx = args.rank * images.shape[0]
-                    end_idx = start_idx + images.shape[0]
-
-                logits_per_image = visual_embs @ last_embedding.t()
-                logits_per_text = logits_per_image.t()
-                if i == 0:
-                    print(
-                        f'Running contrastive loss over logits_per_text.shape = {logits_per_text.shape} and logits_per_image.shape = {logits_per_image.shape}')
-
-                # Compute contrastive losses for retrieval.
-                caption_loss = losses_utils.contrastive_loss(logits_per_text)
-                image_loss = losses_utils.contrastive_loss(logits_per_image)
-                caption_acc1, caption_acc5 = losses_utils.contrastive_acc(logits_per_text, topk=(1, 5))
-                image_acc1, image_acc5 = losses_utils.contrastive_acc(logits_per_image, topk=(1, 5))
-                loss += args.ret_loss_scale * (caption_loss + image_loss) / 2.0
-                cont_losses.update(loss.item(), images.size(0))
-
-                # measure accuracy and record loss
-                top1_caption.update(caption_acc1[0], images.size(0))
-                top5_caption.update(caption_acc5[0], images.size(0))
-                top1_image.update(image_acc1[0], images.size(0))
-                top5_image.update(image_acc5[0], images.size(0))
-
-            if model_mode == 'retrieval':
-                ret_time.update(time.time() - mode_start)
-            elif model_mode == 'captioning':
-                cap_time.update(time.time() - mode_start)
+        ce_loss = model_output.loss
+        loss += ce_loss
+        ce_losses.update(ce_loss.item(), images.size(0))
+        cap_time.update(time.time() - mode_start)
 
         loss = loss / args.grad_accumulation_steps
         losses.update(loss.item(), images.size(0))
@@ -524,24 +467,11 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
 
         # Update weights
         if ((i + 1) % args.grad_accumulation_steps == 0) or (i == args.steps_per_epoch - 1):
-            # Zero out gradients of the embedding matrix outside of [RET].
-            for param in model.module.model.input_embeddings.parameters():
-                assert param.grad.shape[0] == len(tokenizer)
-                # Keep other embeddings frozen.
-                mask = torch.arange(param.grad.shape[0]) != args.retrieval_token_idx
-                param.grad[mask, :] = 0
-
             # compute gradient and do SGD step
             if args.grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             optimizer.zero_grad()
-
-        with torch.no_grad():
-            # Normalize trainable embeddings.
-            frozen_norm = torch.norm(model.module.model.input_embeddings.weight[:-1, :], dim=1).mean(0)
-            trainable_weight = model.module.model.input_embeddings.weight[-1, :]
-            model.module.model.input_embeddings.weight[-1, :].div_(torch.norm(trainable_weight) / frozen_norm)
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -558,12 +488,9 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
                 ce_losses.all_reduce()
                 top1.all_reduce()
                 top5.all_reduce()
-                ret_time.all_reduce()
                 cont_losses.all_reduce()
                 top1_caption.all_reduce()
                 top5_caption.all_reduce()
-                top1_image.all_reduce()
-                top5_image.all_reduce()
                 cap_time.all_reduce()
 
             progress.display(i + 1)
@@ -575,66 +502,13 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
             writer.add_scalar('train/contrastive_loss', cont_losses.avg, actual_step)
             writer.add_scalar('train/t2i_top1_acc', top1_caption.avg, actual_step)
             writer.add_scalar('train/t2i_top5_acc', top5_caption.avg, actual_step)
-            writer.add_scalar('train/i2t_top1_acc', top1_image.avg, actual_step)
-            writer.add_scalar('train/i2t_top5_acc', top5_image.avg, actual_step)
             writer.add_scalar('metrics/total_secs_per_batch', batch_time.avg, actual_step)
             writer.add_scalar('metrics/total_secs_captioning', cap_time.avg, actual_step)
-            writer.add_scalar('metrics/total_secs_retrieval', ret_time.avg, actual_step)
             writer.add_scalar('metrics/data_secs_per_batch', data_time.avg, actual_step)
             writer.add_scalar('metrics/examples_per_sec', ex_per_sec, actual_step)
 
-            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                                                        and args.rank % ngpus_per_node == 0):
-                image_bs = images.shape[0]
-                normalized_images = images - images.min()
-                normalized_images /= normalized_images.max()  # (N, 3, H, W)
-                max_images_to_show = 16
-
-                # Append caption text.
-                pred_tokens = output[:, args.n_visual_tokens - 1:-1, :].argmax(dim=-1)
-                generated_captions = tokenizer.batch_decode(pred_tokens, skip_special_tokens=False)
-
-                # Log image (and generated caption) outputs to Tensorboard.
-                if model_mode == 'captioning':
-                    # Create generated caption text.
-                    generated_cap_images = torch.stack([
-                        utils.create_image_of_text(
-                            generated_captions[i].encode('ascii', 'ignore'),
-                            width=normalized_images.shape[3],
-                            color=(255, 255, 0))
-                        for i in range(len(generated_captions))], axis=0)
-
-                    # Duplicate captions if we concatenated them.
-                    if (args.concat_captions_prob > 0 and model_mode == 'captioning' and generated_cap_images.shape[
-                        0] != caption_images.shape[0]):
-                        generated_cap_images = torch.cat([generated_cap_images, generated_cap_images], axis=0)
-
-                    display_images = torch.cat([normalized_images.float().cpu(), caption_images, generated_cap_images],
-                                               axis=2)[:max_images_to_show]
-                    grid = torchvision.utils.make_grid(display_images, nrow=int(max_images_to_show ** 0.5), padding=4)
-                    writer.add_image('train/images_gen_cap', grid, actual_step)
-
-                # Retrieved images (from text).
-                retrieved_image_idx = logits_per_text[:image_bs, :image_bs].argmax(-1)
-                t2i_images = torch.stack(
-                    [normalized_images[retrieved_image_idx[i], ...] for i in range(len(retrieved_image_idx))],
-                    axis=0)
-                t2i_images = torch.cat([t2i_images.float().cpu(), caption_images], axis=2)[:max_images_to_show]
-                t2i_grid = torchvision.utils.make_grid(t2i_images, nrow=int(max_images_to_show ** 0.5), padding=4)
-                writer.add_image('train/t2i_ret', t2i_grid, actual_step)
-
-                # Retrieved text (from image).
-                retrieved_text_idx = logits_per_image[:image_bs, :image_bs].argmax(-1)
-                retrieved_text = torch.stack(
-                    [caption_images[retrieved_text_idx[i], ...] for i in range(len(retrieved_text_idx))],
-                    axis=0)
-                i2t_images = torch.cat([normalized_images.float().cpu(), retrieved_text], axis=2)[:max_images_to_show]
-                i2t_grid = torchvision.utils.make_grid(i2t_images, nrow=int(max_images_to_show ** 0.5), padding=4)
-                writer.add_image('train/i2t_ret', i2t_grid, actual_step)
-
             batch_time.reset()
             cap_time.reset()
-            ret_time.reset()
             data_time.reset()
             losses.reset()
             ce_losses.reset()
@@ -643,8 +517,6 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
             cont_losses.reset()
             top1_caption.reset()
             top5_caption.reset()
-            top1_image.reset()
-            top5_image.reset()
 
         if i == args.steps_per_epoch - 1:
             break
@@ -652,7 +524,6 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         scheduler.step()
         curr_lr = scheduler.get_last_lr()
         if (actual_step == 1) or (i + 1) % args.print_freq == 0:
-            # Write current learning rate to Tensorboard.
             writer = SummaryWriter(args.log_dir)
             writer.add_scalar('train/lr', curr_lr[0], actual_step)
             writer.close()

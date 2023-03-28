@@ -514,21 +514,7 @@ class TLTLModel(nn.Module):
         else:
             raise NotImplementedError
 
-        if mode == 'captioning':
-            visual_embs = self.visual_embeddings(encoder_outputs)  # (2, D * n_visual_tokens)
-            visual_embs = torch.reshape(visual_embs,
-                                        (visual_embs.shape[0], self.args.n_visual_tokens, -1)
-                                        )
-        elif mode == 'retrieval':
-            visual_embs = self.visual_fc(encoder_outputs)  # (2, D * n_visual_tokens)
-            visual_embs = torch.reshape(visual_embs,
-                                        (visual_embs.shape[0], 1, -1)
-                                        )
-        elif mode == 'no_projection':
-            visual_embs = encoder_outputs
-            return visual_embs
-        else:
-            raise NotImplementedError
+        visual_embs = encoder_outputs
         return visual_embs
 
     def train(self, mode=True):
