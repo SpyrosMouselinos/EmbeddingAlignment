@@ -10,7 +10,7 @@ from transformers import AutoFeatureExtractor
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import requests
 from io import BytesIO
-
+import math
 import random
 
 
@@ -126,31 +126,6 @@ def save_checkpoint(state, is_best, filename='checkpoint'):
         shutil.copyfile(filename + '.pth.tar', filename + '_best.pth.tar')
 
 
-def accuracy(output, target, padding, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        if output.shape[-1] < maxk:
-            print(f"[WARNING] Less than {maxk} predictions available. Using {output.shape[-1]} for topk.")
-
-        maxk = min(maxk, output.shape[-1])
-        batch_size = target.size(0)
-
-        # Take topk along the last dimension.
-        _, pred = output.topk(maxk, -1, True, True)  # (N, T, topk)
-
-        mask = (target != padding).type(target.dtype)
-        target_expand = target[..., None].expand_as(pred)
-        correct = pred.eq(target_expand)
-        correct = correct * mask[..., None].expand_as(correct)
-
-        res = []
-        for k in topk:
-            correct_k = correct[..., :k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / mask.sum()))
-        return res
-
-
 def get_params_count(model, max_name_len: int = 60):
     params = [(name[:max_name_len], p.numel(), str(tuple(p.shape)), p.requires_grad) for name, p in
               model.named_parameters()]
@@ -250,3 +225,30 @@ class AverageMeter(object):
             raise ValueError('invalid summary type %r' % self.summary_type)
 
         return fmtstr.format(**self.__dict__)
+
+
+def accuracy(output, target, padding, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        if output.shape[-1] < maxk:
+            print(f"[WARNING] Less than {maxk} predictions available. Using {output.shape[-1]} for topk.")
+
+        maxk = min(maxk, output.shape[-1])
+
+        # Take topk along the last dimension.
+        _, pred = output.topk(maxk, -1, True, True)  # (N, T, topk)
+        if pred.size()[1] != target.size()[1]:
+            pred = torch.stack([pred] * target.size()[1], dim=1)
+        mask = (target != padding).type(target.dtype)
+        target_expand = target[..., None].expand_as(pred)
+        correct = pred.eq(target_expand)
+        correct = correct * mask[..., None].expand_as(correct)
+
+        res = []
+        for k in topk:
+            correct_k = correct[..., :k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / mask.sum()))
+        return res
+
+

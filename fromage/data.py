@@ -1,21 +1,12 @@
 import ast
-import random
-from typing import Optional, Tuple
-import collections
 import logging
 import os
 import numpy as np
 import pandas as pd
-import torch
-import torchvision.datasets as datasets
-from torchvision import transforms as T
-from PIL import Image, ImageFont
+from PIL import Image
 from torch.utils.data import Dataset
 import torch
-import torch.nn as nn
 import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
 from fromage import utils
 from fromage.utils import get_image_from_url
 
@@ -25,7 +16,7 @@ def collate_fn(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 
-def get_dataset(args, split: str, tokenizer, max_items: int=-1) -> Dataset:
+def get_dataset(args, split: str, tokenizer, max_items: int = -1) -> Dataset:
     assert split in ['train', 'val'
                      ], 'Expected split to be one of "train" or "val", got {split} instead.'
 
@@ -57,13 +48,13 @@ def get_dataset(args, split: str, tokenizer, max_items: int=-1) -> Dataset:
         print(f'{len(dataset_paths)} datasets requested: {dataset_paths}')
         dataset = torch.utils.data.ConcatDataset([
             CsvDataset(path, image_dir, tokenizer, 'image',
-                       'caption', args.visual_model, train=train, max_len=args.max_len, precision=args.precision,
+                       'caption', args.visual_model, train=train, max_len=args.max_len,
                        image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx,
                        save_images=ast.literal_eval(args.save_images), max_items=max_items)
             for (path, image_dir) in zip(dataset_paths, image_data_dirs)])
     elif len(dataset_paths) == 1:
         dataset = CsvDataset(dataset_paths[0], image_data_dirs[0], tokenizer, 'image',
-                             'caption', args.visual_model, train=train, max_len=args.max_len, precision=args.precision,
+                             'caption', args.visual_model, train=train, max_len=args.max_len,
                              image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx,
                              save_images=ast.literal_eval(args.save_images), max_items=max_items)
     else:
@@ -83,7 +74,6 @@ class CsvDataset(Dataset):
                  train: bool = True,
                  max_len: int = 32,
                  sep="\t",
-                 precision: str = 'fp16',
                  image_size: int = 224,
                  retrieval_token_idx: int = -1, save_images: bool = False, max_items=-1):
         logging.debug(f'Loading tsv data from {input_filename}.')
@@ -104,12 +94,10 @@ class CsvDataset(Dataset):
 
         self.tokenizer = tokenizer
         self.max_len = max_len
-        self.precision = precision
         self.retrieval_token_idx = retrieval_token_idx
         self.save_images = save_images
         self.font = None
-
-
+        self.cache_list_ = []
         logging.debug('Done loading data.')
 
     def __len__(self):
@@ -117,22 +105,22 @@ class CsvDataset(Dataset):
 
     def __getitem__(self, idx):
         while True:
-
+            if idx in self.cache_list_:
+                idx = np.random.randint(0, len(self) - 1)
+                continue
             image_path = os.path.join(self.base_image_dir, str(self.images_index[idx]) + '.png')
             caption = str(self.captions[idx])
-
             try:
-                try:
+                if os.path.exists(image_path):
                     img = Image.open(image_path)
-                except FileNotFoundError:
-                    print(f"{self.training_mode} image no {self.images_index[idx]} not found... downloading...\n")
-                    img = get_image_from_url(self.images[idx])
+                else:
+                    try:
+                        img = get_image_from_url(self.images[idx])
+                    except:
+                        raise Exception
                     if self.save_images:
-                        print(f"Saving at: {image_path}")
                         img.save(image_path)
-
                 images = utils.get_pixel_values_for_model(self.feature_extractor, img)
-
                 tokenized_data = self.tokenizer(
                     caption,
                     return_tensors="pt",
@@ -141,9 +129,8 @@ class CsvDataset(Dataset):
                     max_length=self.max_len)
                 tokens = tokenized_data.input_ids[0]
                 caption_len = tokenized_data.attention_mask[0].sum()
-                return images, tokens, caption_len
+                return images, tokens, caption_len, idx
 
             except Exception as e:
-                print(f'Error reading {image_path} with caption {caption}: {e}')
-                # Pick a new example at random.
+                self.cache_list_.append(idx)
                 idx = np.random.randint(0, len(self) - 1)

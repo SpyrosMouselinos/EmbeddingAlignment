@@ -60,7 +60,7 @@ def parse_args(args):
     parser.add_argument('--exp_name', default='frozen', type=str,
                         help='Name of experiment, used for saving checkpoints.')
 
-    parser.add_argument('-j', '--workers', default=1, type=int, metavar='N',
+    parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
 
     parser.add_argument('--epochs', default=10, type=int, metavar='N',
@@ -75,7 +75,7 @@ def parse_args(args):
     parser.add_argument('--val-steps-per-epoch', default=-1, type=int, metavar='N',
                         help='number of validation steps per epoch.')
 
-    parser.add_argument('-b', '--batch-size', default=8, type=int,
+    parser.add_argument('-b', '--batch-size', default=164, type=int,
                         metavar='N',
                         help='mini-batch size (default: 180), this is the total '
                              'batch size of all GPUs on the current node when '
@@ -83,7 +83,7 @@ def parse_args(args):
 
     parser.add_argument('--val-batch-size', default=None, type=int)
 
-    parser.add_argument('--lr', '--learning-rate', default=0.0003, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=0.001, type=float,
                         metavar='LR', help='initial learning rate', dest='lr')
 
     parser.add_argument('--lr-warmup-steps', default=100, type=int,
@@ -100,7 +100,7 @@ def parse_args(args):
 
     parser.add_argument('--grad-clip', default=1.0, type=float, help='gradient clipping amount')
 
-    parser.add_argument('--precision', default='fp32', type=str, choices=['fp32', 'fp16', 'bf16'],
+    parser.add_argument('--precision', default='fp16', type=str, choices=['fp32', 'fp16', 'bf16'],
                         help="Precision to train in.")
 
     parser.add_argument('--cap-loss-scale', type=float, default=1.0, help="Scale on captioning loss.")
@@ -143,10 +143,10 @@ def parse_args(args):
 
     parser.add_argument('--beta1', default=0.9, type=float, metavar='M', help='beta1 for Adam')
     parser.add_argument('--beta2', default=0.95, type=float, metavar='M', help='beta2 for Adam')
-    parser.add_argument('--wd', '--weight-decay', default=0.0, type=float,
+    parser.add_argument('--wd', '--weight-decay', default=0.001, type=float,
                         metavar='W', help='weight decay (default: 0.0)', dest='weight_decay')
 
-    parser.add_argument('-p', '--print-freq', default=10, type=int,
+    parser.add_argument('-p', '--print-freq', default=1, type=int,
                         metavar='N', help='print frequency (default: 10)')
 
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -167,7 +167,7 @@ def parse_args(args):
     parser.add_argument('--dist-backend', default='nccl', type=str,
                         help='distributed backend')
 
-    parser.add_argument('--seed', default=1453, type=int,
+    parser.add_argument('--seed', default=None, type=int,
                         help='seed for initializing training. ')
 
     parser.add_argument('--gpu', default=None, type=int,
@@ -176,7 +176,7 @@ def parse_args(args):
     parser.add_argument('--save_images', default='True', type=str,
                         help='weather to save images into a folder while iterating or not')
 
-    parser.add_argument('--multiprocessing-distributed', action='store_true',
+    parser.add_argument('--multiprocessing-distributed', default=False, action='store_true',
                         help='Use multi-processing distributed training to launch '
                              'N processes per node, which has N GPUs. This is the '
                              'fastest way to use PyTorch for either single node or '
@@ -292,6 +292,25 @@ def main_worker(gpu, ngpus_per_node, args):
     writer.add_scalar('params/total_non_trainable', total_nontrainable_params, 0)
     writer.close()
 
+    optimizer = torch.optim.AdamW(
+        params=[
+            {'params': model.visual_embeddings.parameters(), 'lr': args.lr, 'weight_decay': args.weight_decay},
+            {'params': model.post_visual_embeddings_normalization.parameters(), 'lr': args.lr, 'weight_decay': 0}
+        ],
+        betas=(args.beta1, args.beta2),
+        eps=1e-8
+    )
+
+    """Sets the learning rate to the initial LR decayed by 10 every 5 epochs"""
+    scheduler_steplr = StepLR(optimizer,
+                              step_size=args.lr_schedule_step_size * args.steps_per_epoch,
+                              gamma=args.lr_schedule_gamma)
+
+    scheduler = GradualWarmupScheduler(optimizer,
+                                       multiplier=1.0,
+                                       total_epoch=args.lr_warmup_steps,
+                                       after_scheduler=scheduler_steplr)
+
     if not torch.cuda.is_available():
         print('WARNING: using CPU, this will be slow!')
         model = torch.nn.DataParallel(model)
@@ -312,28 +331,12 @@ def main_worker(gpu, ngpus_per_node, args):
         model = model.cuda(args.gpu)
     else:
         model = torch.nn.DataParallel(model).cuda()
+    #
+    # optimizer = torch.optim.AdamW(model.parameters(), args.lr,
+    #                               betas=(args.beta1, args.beta2),
+    #                               weight_decay=args.weight_decay,
+    #                               eps=1e-8)
 
-    ### LOSS FUNCTION ###
-    # sparse_targets = torch.zeros(50267).scatter_(0, targets, torch.ones(50267)).to('cuda')
-    criterion = AsymmetricLossOptimized(gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos)
-    optimizer_cls = torch.optim.AdamW
-    print('Using torch.optim.AdamW as the optimizer.')
-    optimizer = optimizer_cls(model.parameters(), args.lr,
-                              betas=(args.beta1, args.beta2),
-                              weight_decay=args.weight_decay,
-                              eps=1e-8)
-
-    """Sets the learning rate to the initial LR decayed by 10 every 5 epochs"""
-    scheduler_steplr = StepLR(optimizer,
-                              step_size=args.lr_schedule_step_size * args.steps_per_epoch,
-                              gamma=args.lr_schedule_gamma)
-
-    scheduler = GradualWarmupScheduler(optimizer,
-                                       multiplier=1.0,
-                                       total_epoch=args.lr_warmup_steps,
-                                       after_scheduler=scheduler_steplr)
-
-    # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
@@ -356,11 +359,9 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    cudnn.benchmark = True
-
     # Data loading code
-    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=100)
-    val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=100)
+    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=5000)
+    val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=1000)
     print(f'Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples.')
 
     if args.distributed:
@@ -377,25 +378,22 @@ def main_worker(gpu, ngpus_per_node, args):
         val_dataset, batch_size=(args.val_batch_size or args.batch_size), shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    if args.evaluate:
-        evaluate.validate(val_loader, model, tokenizer, criterion, -1, args)
-        return
-
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler, args)
+        print(f"Performing Training Epoch: {epoch}")
+        train(train_loader, model, optimizer, epoch, scheduler, args)
 
         # evaluate on validation set
-        #eval_score = evaluate.validate(val_loader, model, tokenizer, criterion, epoch, args)
+        # eval_score = evaluate.validate(val_loader, model, tokenizer, criterion, epoch, args)
 
         # remember best score and save checkpoint
         is_best = True
         best_score = -1
-        #is_best = eval_score > best_score
-        #best_score = max(eval_score, best_score)
+        # is_best = eval_score > best_score
+        # best_score = max(eval_score, best_score)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
@@ -415,68 +413,50 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
     cap_time = utils.AverageMeter('CaptioningTime', ':6.3f')
     data_time = utils.AverageMeter('Data', ':6.3f')
     losses = utils.AverageMeter('Loss', ':.4e')
-    ce_losses = utils.AverageMeter('CeLoss', ':.4e')
     top1 = utils.AverageMeter('Acc@1', ':6.2f')
     top5 = utils.AverageMeter('Acc@5', ':6.2f')
-    cont_losses = utils.AverageMeter('ContLoss', ':.4e')
-    top1_caption = utils.AverageMeter('AccCaption@1', ':6.2f')
-    top5_caption = utils.AverageMeter('AccCaption@5', ':6.2f')
 
     writer = SummaryWriter(args.log_dir)
 
     progress = utils.ProgressMeter(
         args.steps_per_epoch,
-        [batch_time, losses, ce_losses, cont_losses, top1, top5],
+        [batch_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
-    # switch to train mode
     model.train()
+    start = time.time()
 
-    end = time.time()
-
-    for i, (image_paths, images, caption_images, tgt_tokens, token_len) in enumerate(train_loader):
+    for i, (images, tokens, caption_len, image_index) in enumerate(train_loader):
         actual_step = epoch * args.steps_per_epoch + i + 1
-        # measure data loading time
-        data_time.update(time.time() - end)
+        data_time.update(time.time() - start)
 
         if torch.cuda.is_available():
             images = images.cuda(args.gpu, non_blocking=True)
-            tgt_tokens = tgt_tokens.cuda(args.gpu, non_blocking=True)
+            # tokens = tokens.cuda(args.gpu, non_blocking=True)
 
         images = images.half()
-        loss = 0
-        mode_start = time.time()
+        visual_embs, logits, loss = model(images=images,
+                                          labels=tokens,
+                                          tensors=None,
+                                          mode='no_projection')
 
-        (model_output, full_labels, last_embedding, _, visual_embs) = model(pixel_values=images,
-                                                                            labels=tgt_tokens,
-                                                                            mode='no_projection')
-
-        output = model_output.logits
-        # Measure captioning accuracy for multi-task models and next-token prediction for retrieval models.
-        acc1, acc5 = utils.accuracy(output[:, :-1, :], full_labels[:, 1:], -100, topk=(1, 5))
+        acc1, acc5 = utils.accuracy(logits.detach().cpu().float(),
+                                    tokens.detach().cpu().float(),
+                                    -100, topk=(1, 5))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
-
-        ce_loss = model_output.loss
-        loss += ce_loss
-        ce_losses.update(ce_loss.item(), images.size(0))
-        cap_time.update(time.time() - mode_start)
 
         loss = loss / args.grad_accumulation_steps
         losses.update(loss.item(), images.size(0))
         loss.backward()
 
-        # Update weights
         if ((i + 1) % args.grad_accumulation_steps == 0) or (i == args.steps_per_epoch - 1):
             # compute gradient and do SGD step
             if args.grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             optimizer.zero_grad()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+        batch_time.update(time.time() - start)
 
         if actual_step == 1 or (i + 1) % args.print_freq == 0:
             ex_per_sec = args.batch_size / batch_time.avg
@@ -486,23 +466,15 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
                 ex_per_sec = (args.batch_size / batch_time.avg) * ngpus_per_node
 
                 losses.all_reduce()
-                ce_losses.all_reduce()
                 top1.all_reduce()
                 top5.all_reduce()
-                cont_losses.all_reduce()
-                top1_caption.all_reduce()
-                top5_caption.all_reduce()
                 cap_time.all_reduce()
 
             progress.display(i + 1)
 
             writer.add_scalar('train/loss', losses.avg, actual_step)
-            writer.add_scalar('train/ce_loss', ce_losses.avg, actual_step)
             writer.add_scalar('train/seq_top1_acc', top1.avg, actual_step)
             writer.add_scalar('train/seq_top5_acc', top5.avg, actual_step)
-            writer.add_scalar('train/contrastive_loss', cont_losses.avg, actual_step)
-            writer.add_scalar('train/t2i_top1_acc', top1_caption.avg, actual_step)
-            writer.add_scalar('train/t2i_top5_acc', top5_caption.avg, actual_step)
             writer.add_scalar('metrics/total_secs_per_batch', batch_time.avg, actual_step)
             writer.add_scalar('metrics/total_secs_captioning', cap_time.avg, actual_step)
             writer.add_scalar('metrics/data_secs_per_batch', data_time.avg, actual_step)
@@ -512,12 +484,8 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
             cap_time.reset()
             data_time.reset()
             losses.reset()
-            ce_losses.reset()
             top1.reset()
             top5.reset()
-            cont_losses.reset()
-            top1_caption.reset()
-            top5_caption.reset()
 
         if i == args.steps_per_epoch - 1:
             break

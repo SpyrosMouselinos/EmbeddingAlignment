@@ -1,23 +1,12 @@
-from typing import Callable, List, Optional, Tuple, Union
+from typing import List, Optional
 from collections import namedtuple
 import json
-import glob
-import math
-import numpy as np
-import os
 import torch
-from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-from functools import partial
-import pickle as pkl
-from PIL import Image, UnidentifiedImageError
 import copy
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 from transformers import OPTForCausalLM, GPT2Tokenizer
-from transformers import CLIPVisionModel, CLIPVisionConfig
-from losses import AsymmetricLossOptimized
+from transformers import CLIPVisionModel
+from fromage.losses import AsymmetricLossOptimized
 from fromage import utils
 
 
@@ -479,6 +468,7 @@ class TLTLModel(nn.Module):
         self.unembed = copy.deepcopy(self.lm.lm_head)
         print("[Step 3]: Freezing the Unembed Layer... \n")
         self.unembed.eval()
+        self.unembed.float()
         for param in self.unembed.parameters():
             param.requires_grad = False
 
@@ -488,17 +478,21 @@ class TLTLModel(nn.Module):
         self.active_vocab_size = self.unembed.weight.size()[0]
         print("[Step 4]: Restoring the VM...\n")
         self.visual_model_name = visual_encoder
-        self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder, torch_dtype=torch.float16)
+        self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder)
+
         visual_hidden_size = self.visual_model.config.hidden_size
         print("[Step 5]: Freezing the VM... \n")
+        self.visual_model.half()
         self.visual_model.eval()
         for param in self.visual_model.parameters():
             param.requires_grad = False
 
         embedding_dim = language_hidden_size * self.args.n_visual_tokens
         self.visual_embeddings = nn.Linear(visual_hidden_size, embedding_dim, bias=True)
+
         self.post_visual_embeddings_normalization = nn.LayerNorm(normalized_shape=language_hidden_size,
                                                                  elementwise_affine=True)
+
         self.gamma_neg = self.args.gamma_neg if self.args.gamma_neg is not None else 4
         self.gamma_pos = self.args.gamma_pos if self.args.gamma_pos is not None else 1
         self.loss_fn = AsymmetricLossOptimized(gamma_neg=self.gamma_neg, gamma_pos=self.gamma_pos)
@@ -521,49 +515,59 @@ class TLTLModel(nn.Module):
             raise NotImplementedError
 
         visual_embs = encoder_outputs
+        visual_embs = visual_embs.float()
         return visual_embs
 
     def train(self, mode=True):
         super(TLTLModel, self).train(mode=mode)
         self.unembed.eval()
+        for param in self.unembed.parameters():
+            param.requires_grad = False
         self.visual_model.eval()
         self.visual_embeddings.train()
         self.post_visual_embeddings_normalization.train()
+        self.visual_model.half()
 
     def calc_loss_(self, x, y):
-        sparse_y = torch.zeros(self.active_vocab_size).scatter_(0, y, torch.ones(self.active_vocab_size)).to(
-            device=self.visual_embeddings.weights.device)
+        batch_size, _ = x.size()
+        sparse_y = torch.zeros(batch_size,
+                               self.active_vocab_size,
+                               device=y.device).scatter_(1, y, torch.ones(batch_size,
+                                                                          self.active_vocab_size, device=y.device))
+        sparse_y[:, 0] = 0
+        sparse_y[:, 1] = 0
+        sparse_y[:, 2] = 0
         loss = self.loss_fn(x, sparse_y)
         return loss
 
     def forward(self,
                 images: torch.FloatTensor,
                 labels: torch.LongTensor,
+                tensors=None,
                 mode: str = 'no_projection'):
 
-        visual_embs = self.get_visual_embs(images, mode)
-        batch_size, vis_seq_len, _ = visual_embs.shape  # vis_seq_len = n_visual_tokens
+        ### Part 1: Get the visual representation or tensor ###
+        if tensors is None:
+            visual_embs = self.get_visual_embs(images, mode)
+            batch_size, _ = visual_embs.shape  # vis_seq_len = n_visual_tokens
+        else:
+            visual_embs = tensors
+            batch_size, _ = visual_embs.shape
+
+        ### Part 2: Project it and transform it ###
+        visual_embs = self.visual_embeddings(visual_embs)
+        visual_embs = self.post_visual_embeddings_normalization(visual_embs)
+
+        ### Part 3: Use the Unembedding Layer to translate into the LM-Space ###
+        logits = self.unembed(visual_embs)
+
+        ### Part 4: Calculate the Loss ###
         if labels is not None:
-            assert labels.shape[0] == batch_size, (visual_embs.shape, labels.shape)
-
-        full_labels = torch.zeros(visual_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100
-
-        output = None
-        full_labels = torch.cat([full_labels, labels], axis=1)
-        pad_idx = []
-
-        for label in full_labels:
-            for k, token in enumerate(label):
-                # Mask out retrieval token if it exists.
-                if token in [self.tokenizer.pad_token_id, self.retrieval_token_idx]:
-                    label[k:] = -100
-                    pad_idx.append(k)
-                    break
-                if k == len(label) - 1:  # No padding found.
-                    pad_idx.append(k + 1)
-        assert len(pad_idx) == batch_size, (len(pad_idx), batch_size)
-
-        return output
+            assert labels.shape[0] == batch_size
+            loss = self.calc_loss_(logits, labels)
+        else:
+            loss = None
+        return visual_embs, logits, loss
 
 
 def load_tltl(model_dir: str) -> TLTLModel:
