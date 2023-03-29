@@ -49,7 +49,7 @@ def parse_args(args):
     parser.add_argument('--log-base-dir', default='./runs/', type=str,
                         help='Base directory to write logs and ckpts to.')
 
-    parser.add_argument('--exp_name', default='frozen', type=str,
+    parser.add_argument('--exp_name', default='adjusted', type=str,
                         help='Name of experiment, used for saving checkpoints.')
 
     parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
@@ -141,7 +141,7 @@ def parse_args(args):
     parser.add_argument('-p', '--print-freq', default=90, type=int,
                         metavar='N', help='print frequency (default: 10)')
 
-    parser.add_argument('--resume', default='./runs/frozen', type=str, metavar='PATH',
+    parser.add_argument('--resume', default='./runs/frozen/ckpt_best.pth.tar', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
 
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -325,7 +325,7 @@ def main_worker(gpu, ngpus_per_node, args):
         model = torch.nn.DataParallel(model).cuda()
 
     if args.resume:
-        if os.path.isfile(args.resume):
+        if os.path.exists(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             if args.gpu is None:
                 checkpoint = torch.load(args.resume)
@@ -347,7 +347,7 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     # Data loading code
-    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=100)
+    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=50_000)
     val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=1_000)
     print(f'Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples.')
 
@@ -362,7 +362,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=(args.val_batch_size or args.batch_size), shuffle=False,
+        val_dataset, batch_size= args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -371,7 +371,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # Train for one epoch
         print(f"Performing Training Epoch: {epoch}")
-        #train(train_loader, model, optimizer, epoch, scheduler, args)
+        train(train_loader, model, optimizer, epoch, scheduler, args)
 
         # Evaluate on validation set
         eval_loss, eval_accs = evaluate(val_loader, model, args)

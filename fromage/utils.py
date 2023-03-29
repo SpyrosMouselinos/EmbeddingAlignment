@@ -238,8 +238,8 @@ def accuracy(output, target, padding, topk=(1,)):
 
         # Take topk along the last dimension.
         _, pred = output.topk(maxk, -1, True, True)  # (N, T, topk)
-        if pred.size()[1] != target.size()[1]:
-            pred = torch.stack([pred] * target.size()[1], dim=1)
+        # Replicate predictions TOPK times #
+        pred = torch.stack([pred] * target.size()[1], dim=1)
         mask = (target != padding).type(target.dtype)
         target_expand = target[..., None].expand_as(pred)
         correct = pred.eq(target_expand)
