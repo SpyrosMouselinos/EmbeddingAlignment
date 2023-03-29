@@ -4,8 +4,6 @@ import os
 import sys
 import time
 import warnings
-import numpy as np
-from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -17,18 +15,12 @@ from warmup_scheduler import GradualWarmupScheduler
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.datasets as datasets
-from torch.utils.tensorboard import SummaryWriter
-import torchvision
 
+from torch.utils.tensorboard import SummaryWriter
 from fromage import data
-from fromage import losses as losses_utils
 from fromage import models
 from fromage import utils
-from fromage import evaluate
 from transformers import AutoTokenizer
-
-from fromage.losses import AsymmetricLossOptimized
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 visual_models = ['openai/clip-vit-large-patch14', 'openai/clip-vit-large-patch14-336']
@@ -66,7 +58,7 @@ def parse_args(args):
     parser.add_argument('--epochs', default=10, type=int, metavar='N',
                         help='number of total epochs to run')
 
-    parser.add_argument('--steps-per-epoch', default=2000, type=int, metavar='N',
+    parser.add_argument('--steps-per-epoch', default=196, type=int, metavar='N',
                         help='number of training steps per epoch')
 
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
@@ -75,7 +67,7 @@ def parse_args(args):
     parser.add_argument('--val-steps-per-epoch', default=-1, type=int, metavar='N',
                         help='number of validation steps per epoch.')
 
-    parser.add_argument('-b', '--batch-size', default=164, type=int,
+    parser.add_argument('-b', '--batch-size', default=256, type=int,
                         metavar='N',
                         help='mini-batch size (default: 180), this is the total '
                              'batch size of all GPUs on the current node when '
@@ -89,7 +81,7 @@ def parse_args(args):
     parser.add_argument('--lr-warmup-steps', default=100, type=int,
                         metavar='N', help='Number of steps to warm up lr.')
 
-    parser.add_argument('--lr-schedule-step-size', default=10, type=int,
+    parser.add_argument('--lr-schedule-step-size', default=3, type=int,
                         metavar='N', help='Number of steps before decaying lr.')
 
     parser.add_argument('--lr-schedule-gamma', default=0.1, type=float,
@@ -98,7 +90,7 @@ def parse_args(args):
     parser.add_argument('--grad-accumulation-steps', default=1, type=int, metavar='N',
                         help='number of gradient accumulation steps')
 
-    parser.add_argument('--grad-clip', default=1.0, type=float, help='gradient clipping amount')
+    parser.add_argument('--grad-clip', default=-1.0, type=float, help='gradient clipping amount')
 
     parser.add_argument('--precision', default='fp16', type=str, choices=['fp32', 'fp16', 'bf16'],
                         help="Precision to train in.")
@@ -146,10 +138,10 @@ def parse_args(args):
     parser.add_argument('--wd', '--weight-decay', default=0.001, type=float,
                         metavar='W', help='weight decay (default: 0.0)', dest='weight_decay')
 
-    parser.add_argument('-p', '--print-freq', default=1, type=int,
+    parser.add_argument('-p', '--print-freq', default=90, type=int,
                         metavar='N', help='print frequency (default: 10)')
 
-    parser.add_argument('--resume', default='', type=str, metavar='PATH',
+    parser.add_argument('--resume', default='./runs/frozen', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
 
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -331,11 +323,6 @@ def main_worker(gpu, ngpus_per_node, args):
         model = model.cuda(args.gpu)
     else:
         model = torch.nn.DataParallel(model).cuda()
-    #
-    # optimizer = torch.optim.AdamW(model.parameters(), args.lr,
-    #                               betas=(args.beta1, args.beta2),
-    #                               weight_decay=args.weight_decay,
-    #                               eps=1e-8)
 
     if args.resume:
         if os.path.isfile(args.resume):
@@ -360,8 +347,8 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     # Data loading code
-    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=5000)
-    val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=1000)
+    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=100)
+    val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=1_000)
     print(f'Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples.')
 
     if args.distributed:
@@ -382,18 +369,16 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        # train for one epoch
+        # Train for one epoch
         print(f"Performing Training Epoch: {epoch}")
-        train(train_loader, model, optimizer, epoch, scheduler, args)
+        #train(train_loader, model, optimizer, epoch, scheduler, args)
 
-        # evaluate on validation set
-        # eval_score = evaluate.validate(val_loader, model, tokenizer, criterion, epoch, args)
+        # Evaluate on validation set
+        eval_loss, eval_accs = evaluate(val_loader, model, args)
 
         # remember best score and save checkpoint
-        is_best = True
-        best_score = -1
-        # is_best = eval_score > best_score
-        # best_score = max(eval_score, best_score)
+        is_best = eval_loss > best_score
+        best_score = max(eval_loss, best_score)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
@@ -415,12 +400,13 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
     losses = utils.AverageMeter('Loss', ':.4e')
     top1 = utils.AverageMeter('Acc@1', ':6.2f')
     top5 = utils.AverageMeter('Acc@5', ':6.2f')
+    top24 = utils.AverageMeter('Acc@24', ':6.2f')
 
     writer = SummaryWriter(args.log_dir)
 
     progress = utils.ProgressMeter(
         args.steps_per_epoch,
-        [batch_time, losses, top1, top5],
+        [batch_time, losses, top1, top5, top24],
         prefix="Epoch: [{}]".format(epoch))
 
     model.train()
@@ -440,11 +426,12 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
                                           tensors=None,
                                           mode='no_projection')
 
-        acc1, acc5 = utils.accuracy(logits.detach().cpu().float(),
-                                    tokens.detach().cpu().float(),
-                                    -100, topk=(1, 5))
+        acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
+                                           tokens.detach().cpu().float(),
+                                           -100, topk=(1, 5, 24))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
+        top24.update(acc24[0], images.size(0))
 
         loss = loss / args.grad_accumulation_steps
         losses.update(loss.item(), images.size(0))
@@ -475,6 +462,7 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
             writer.add_scalar('train/loss', losses.avg, actual_step)
             writer.add_scalar('train/seq_top1_acc', top1.avg, actual_step)
             writer.add_scalar('train/seq_top5_acc', top5.avg, actual_step)
+            writer.add_scalar('train/seq_top24_acc', top24.avg, actual_step)
             writer.add_scalar('metrics/total_secs_per_batch', batch_time.avg, actual_step)
             writer.add_scalar('metrics/total_secs_captioning', cap_time.avg, actual_step)
             writer.add_scalar('metrics/data_secs_per_batch', data_time.avg, actual_step)
@@ -498,6 +486,51 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
             writer.close()
 
     writer.close()
+
+
+def evaluate(val_loader, model, args):
+    """Main evaluation loop."""
+    losses = utils.AverageMeter('Val Loss', ':.4e')
+    top1 = utils.AverageMeter('Val Acc@1', ':6.2f')
+    top5 = utils.AverageMeter('Val Acc@5', ':6.2f')
+    top24 = utils.AverageMeter('Val Acc@24', ':6.2f')
+
+    writer = SummaryWriter(args.log_dir)
+    model.eval()
+
+    with torch.no_grad():
+        for i, (images, tokens, caption_len, image_index) in enumerate(val_loader):
+            if torch.cuda.is_available():
+                images = images.cuda(args.gpu, non_blocking=True)
+
+            images = images.half()
+            visual_embs, logits, loss = model(images=images,
+                                              labels=tokens,
+                                              tensors=None,
+                                              mode='no_projection')
+
+            acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
+                                               tokens.detach().cpu().float(),
+                                               -100, topk=(1, 5, 24))
+
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+            top24.update(acc24[0], images.size(0))
+            losses.update(loss.item(), images.size(0))
+
+    if args.distributed:
+        losses.all_reduce()
+        top1.all_reduce()
+        top5.all_reduce()
+        top24.all_reduce()
+
+    writer.add_scalar('val/loss', losses.avg)
+    writer.add_scalar('val/seq_top1_acc', top1.avg)
+    writer.add_scalar('val/seq_top5_acc', top5.avg)
+    writer.add_scalar('val/seq_top24_acc', top24.avg)
+    writer.close()
+
+    return losses.avg, (top1.avg, top5.avg, top24.avg)
 
 
 if __name__ == '__main__':

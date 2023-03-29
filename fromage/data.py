@@ -79,6 +79,7 @@ class CsvDataset(Dataset):
         logging.debug(f'Loading tsv data from {input_filename}.')
         df = pd.read_csv(input_filename, sep=sep, header=None, names=[caption_key, img_key])
         df['img_index'] = list(range(0, df.shape[0]))
+        self.max_img_index = df['img_index'].max()
         self.max_items = max_items
         self.base_image_dir = base_image_dir
         self.images = df[img_key].tolist()[:self.max_items]
@@ -99,6 +100,43 @@ class CsvDataset(Dataset):
         self.font = None
         self.cache_list_ = []
         logging.debug('Done loading data.')
+        self.build_dataset_()
+
+    def build_dataset_(self):
+        FILE_PATH = os.path.join(self.base_image_dir, 'corrupted_indexes.txt')
+        if os.path.exists(FILE_PATH):
+            with open(FILE_PATH, 'r') as fin:
+                self.cache_list_ = [int(f) for f in list(set(fin.readline().strip().split(',')))]
+        if self.max_items == -1:
+            MAX_INDEX = self.max_img_index
+        else:
+            MAX_INDEX = self.max_items
+
+        for i in range(MAX_INDEX):
+            if i in self.cache_list_:
+                print(f"[OLD] Image {i} not found")
+                continue
+
+            # ELse
+
+            image_path = os.path.join(self.base_image_dir, str(self.images_index[i]) + '.png')
+            if os.path.exists(image_path):
+                pass
+            else:
+                try:
+                    img = get_image_from_url(self.images[i])
+                    if self.save_images:
+                        img.save(image_path)
+                except:
+                    self.cache_list_.append(i)
+                    print(f"[NEW] Image {i} not found")
+        with open(FILE_PATH, 'w') as fout:
+            lll = len(self.cache_list_)
+            for i, j in enumerate(list(set(self.cache_list_))):
+                fout.write(str(j))
+                if i < lll - 1:
+                    fout.write(',')
+
 
     def __len__(self):
         return len(self.captions)
@@ -117,6 +155,7 @@ class CsvDataset(Dataset):
                     try:
                         img = get_image_from_url(self.images[idx])
                     except:
+                        print(f"Image {idx} not found")
                         raise Exception
                     if self.save_images:
                         img.save(image_path)
