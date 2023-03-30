@@ -8,6 +8,7 @@ from transformers import OPTForCausalLM, GPT2Tokenizer
 from transformers import CLIPVisionModel
 from fromage.losses import AsymmetricLossOptimized
 from fromage import utils
+import torch.nn.functional as F
 
 
 class FrozenArgs:
@@ -447,6 +448,84 @@ class FrozenArgs:
 #         return out, output_embeddings, output_logits
 
 
+class LLMGENWrapper(nn.Module):
+    def __init__(self, model, tokenizer):
+        super().__init__()
+        self.model = model
+        self.model.eval()
+        self.input_embeddings = self.model.model.decoder.embed_tokens
+        self.tokenizer = tokenizer
+
+    def forward(self, inputs):
+        return self.model(inputs)
+
+    def generate(self, embeddings=torch.FloatTensor, max_len: int = 32, temperature: float = 0.0, top_p: float = 1.0,
+                 filter_value: float = -float('Inf')):
+        """Runs greedy decoding and returns generated captions.
+        Args:
+          embeddings: Input condition that the model uses for autoregressive generation.
+          max_len: Maximum number of tokens to generate.
+          temperature: Used to modulate logit distribution.
+          top_p: If set to < 1, the smallest set of tokens with highest probabilities that add up to top_p or higher are kept for generation.
+          filter_value: Value to assign to tokens that should never be generated.
+        Outputs:
+          out: (N, T) int32 sequence of output tokens.
+          output_embeddings: (N, T, 256) sequence of text output embeddings.
+        """
+
+        with torch.no_grad():
+            batch_size, s, _ = embeddings.shape
+            out = None
+            output_logits = []
+
+            for i in range(max_len):
+                output = self.model(inputs_embeds=embeddings, use_cache=False, output_hidden_states=False)
+                logits = output.logits[:, -1, :]
+                if top_p == 1.0:
+                    logits = logits.cpu()
+                output_logits.append(logits)
+
+                if temperature == 0.0:
+                    if top_p != 1.0:
+                        raise ValueError('top_p cannot be set if temperature is 0 (greedy decoding).')
+                    next_token = torch.argmax(logits, keepdim=True, dim=-1)  # (N, 1)
+                else:
+                    logits = logits / temperature
+
+                    # Apply top-p filtering.
+                    if top_p < 1.0:
+                        assert top_p > 0, f'top_p should be above 0, got {top_p} instead.'
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True)  # (N, D) and (N, D)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)  # (N, D)
+
+                        # Remove tokens with cumulative probability above the threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        # Shift the indices to the right to keep also the first token above the threshold
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+
+                        for j in range(sorted_indices.shape[0]):
+                            indices_to_remove = sorted_indices[j, sorted_indices_to_remove[j, :]]
+                            logits[j, indices_to_remove] = filter_value
+
+                    try:
+                        token_weights = logits.exp()  # (N, vocab_size)
+                        next_token = torch.multinomial(token_weights, 1)  # (N, 1)
+                    except:
+                        return token_weights, _, _
+
+                next_token = next_token.long().to(embeddings.device)
+                if out is not None:
+                    out = torch.cat([out, next_token], dim=-1)
+                else:
+                    out = next_token
+
+                next_embedding = self.input_embeddings(next_token)
+                embeddings = torch.cat([embeddings, next_embedding], dim=1)
+
+        return out, output_logits
+
+
 class TLTLModel(nn.Module):
     def __init__(self, tokenizer, args: FrozenArgs = FrozenArgs()):
         super().__init__()
@@ -471,7 +550,6 @@ class TLTLModel(nn.Module):
         self.unembed.float()
         for param in self.unembed.parameters():
             param.requires_grad = False
-
         self.lm = None
         del self.lm
         language_hidden_size = self.unembed.weight.size()[1]
@@ -482,7 +560,6 @@ class TLTLModel(nn.Module):
 
         visual_hidden_size = self.visual_model.config.hidden_size
         print("[Step 5]: Freezing the VM... \n")
-        self.visual_model.half()
         self.visual_model.eval()
         for param in self.visual_model.parameters():
             param.requires_grad = False
@@ -515,7 +592,6 @@ class TLTLModel(nn.Module):
             raise NotImplementedError
 
         visual_embs = encoder_outputs
-        visual_embs = visual_embs.float()
         return visual_embs
 
     def train(self, mode=True):
@@ -526,7 +602,12 @@ class TLTLModel(nn.Module):
         self.visual_model.eval()
         self.visual_embeddings.train()
         self.post_visual_embeddings_normalization.train()
-        self.visual_model.half()
+
+    def custom_eval(self):
+        self.unembed.eval()
+        self.visual_model.eval()
+        self.visual_embeddings.eval()
+        self.post_visual_embeddings_normalization.eval()
 
     def calc_loss_(self, x, y):
         batch_size, _ = x.size()

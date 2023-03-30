@@ -9,6 +9,13 @@ import torch
 import torch.nn.parallel
 from fromage import utils
 from fromage.utils import get_image_from_url
+from nltk.tokenize import word_tokenize
+import string
+from nltk.corpus import stopwords
+STOP_WORDS = set(stopwords.words('english'))
+PUNC_TABLE = str.maketrans('', '', string.punctuation)
+
+
 
 
 def collate_fn(batch):
@@ -114,7 +121,7 @@ class CsvDataset(Dataset):
 
         for i in range(MAX_INDEX):
             if i in self.cache_list_:
-                print(f"[OLD] Image {i} not found")
+                #print(f"[OLD] Image {i} not found")
                 continue
 
             # ELse
@@ -137,6 +144,15 @@ class CsvDataset(Dataset):
                 if i < lll - 1:
                     fout.write(',')
 
+    def clean_caption(self, caption):
+        tokens = word_tokenize(caption)
+        tokens = [w.lower() for w in tokens]
+        stripped = [w.translate(PUNC_TABLE) for w in tokens]
+        words = [word for word in stripped if word.isalpha()]
+        words = [w for w in words if not w in STOP_WORDS]
+        new_caption = ' '.join(words)
+        new_caption = new_caption.strip()
+        return new_caption
 
     def __len__(self):
         return len(self.captions)
@@ -144,10 +160,13 @@ class CsvDataset(Dataset):
     def __getitem__(self, idx):
         while True:
             if idx in self.cache_list_:
-                idx = np.random.randint(0, len(self) - 1)
+                idx = idx + 1
                 continue
             image_path = os.path.join(self.base_image_dir, str(self.images_index[idx]) + '.png')
             caption = str(self.captions[idx])
+            #print(f"Caption Before:{caption}\n")
+            caption = self.clean_caption(caption)
+            #print(f"Caption After:{caption}\n")
             try:
                 if os.path.exists(image_path):
                     img = Image.open(image_path)
