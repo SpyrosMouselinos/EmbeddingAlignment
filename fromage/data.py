@@ -12,10 +12,10 @@ from fromage.utils import get_image_from_url
 from nltk.tokenize import word_tokenize
 import string
 from nltk.corpus import stopwords
+from datasets import load_dataset
+
 STOP_WORDS = set(stopwords.words('english'))
 PUNC_TABLE = str.maketrans('', '', string.punctuation)
-
-
 
 
 def collate_fn(batch):
@@ -121,7 +121,7 @@ class CsvDataset(Dataset):
 
         for i in range(MAX_INDEX):
             if i in self.cache_list_:
-                #print(f"[OLD] Image {i} not found")
+                # print(f"[OLD] Image {i} not found")
                 continue
 
             # ELse
@@ -161,12 +161,14 @@ class CsvDataset(Dataset):
         while True:
             if idx in self.cache_list_:
                 idx = idx + 1
+                if idx >= len(self.captions):
+                    idx = 0
                 continue
             image_path = os.path.join(self.base_image_dir, str(self.images_index[idx]) + '.png')
             caption = str(self.captions[idx])
-            #print(f"Caption Before:{caption}\n")
+            # print(f"Caption Before:{caption}\n")
             caption = self.clean_caption(caption)
-            #print(f"Caption After:{caption}\n")
+            # print(f"Caption After:{caption}\n")
             try:
                 if os.path.exists(image_path):
                     img = Image.open(image_path)
@@ -192,3 +194,263 @@ class CsvDataset(Dataset):
             except Exception as e:
                 self.cache_list_.append(idx)
                 idx = np.random.randint(0, len(self) - 1)
+
+
+class ImgDataset(Dataset):
+    def __init__(self,
+                 dataset,
+                 tokenizer,
+                 feature_extractor_model: str,
+                 train: bool = True,
+                 max_len: int = 32,
+                 image_size: int = 224):
+        self.max_img_index = len(dataset) - 1
+        self.max_items = len(dataset)
+        self.images = dataset['img'][:1_000]
+        self.fine_captions = dataset['fine_label'][:1_000]
+
+        self.training_mode = 'training' if train else 'validation'
+
+        self.feature_extractor_model = feature_extractor_model
+        self.feature_extractor = utils.get_feature_extractor_for_model(
+            feature_extractor_model, image_size=image_size, train=False)
+        self.image_size = image_size
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.fine_label_translation_table = {
+            0: 'apple',
+
+            1: 'aquarium fish',
+
+            2: 'baby',
+
+            3: 'bear',
+
+            4: 'beaver',
+
+            5: 'bed',
+
+            6: 'bee',
+
+            7: 'beetle',
+
+            8: 'bicycle',
+
+            9: 'bottle',
+
+            10: 'bowl',
+
+            11: 'boy',
+
+            12: 'bridge',
+
+            13: 'bus',
+
+            14: 'butterfly',
+
+            15: 'camel',
+
+            16: 'can',
+
+            17: 'castle',
+
+            18: 'caterpillar',
+
+            19: 'cattle',
+
+            20: 'chair',
+
+            21: 'chimpanzee',
+
+            22: 'clock',
+
+            23: 'cloud',
+
+            24: 'cockroach',
+
+            25: 'couch',
+
+            26: 'cra',
+
+            27: 'crocodile',
+
+            28: 'cup',
+
+            29: 'dinosaur',
+
+            30: 'dolphin',
+
+            31: 'elephant',
+
+            32: 'flatfish',
+
+            33: 'forest',
+
+            34: 'fox',
+
+            35: 'girl',
+
+            36: 'hamster',
+
+            37: 'house',
+
+            38: 'kangaroo',
+
+            39: 'keyboard',
+
+            40: 'lamp',
+
+            41: 'lawn mower',
+
+            42: 'leopard',
+
+            43: 'lion',
+
+            44: 'lizard',
+
+            45: 'lobster',
+
+            46: 'man',
+
+            47: 'maple tree',
+
+            48: 'motorcycle',
+
+            49: 'mountain',
+
+            50: 'mouse',
+
+            51: 'mushroom',
+
+            52: 'oak tree',
+
+            53: 'orange',
+
+            54: 'orchid',
+
+            55: 'otter',
+
+            56: 'palm tree',
+
+            57: 'pear',
+
+            58: 'pickup truck',
+
+            59: 'pine tree',
+
+            60: 'plain',
+
+            61: 'plate',
+
+            62: 'poppy',
+
+            63: 'porcupine',
+
+            64: 'possum',
+
+            65: 'rabbit',
+
+            66: 'raccoon',
+
+            67: 'ray',
+
+            68: 'road',
+
+            69: 'rocket',
+
+            70: 'rose',
+
+            71: 'sea',
+
+            72: 'seal',
+
+            73: 'shark',
+
+            74: 'shrew',
+
+            75: 'skunk',
+
+            76: 'skyscraper',
+
+            77: 'snail',
+
+            78: 'snake',
+
+            79: 'spider',
+
+            80: 'squirrel',
+
+            81: 'streetcar',
+
+            82: 'sunflower',
+
+            83: 'sweet pepper',
+
+            84: 'table',
+
+            85: 'tank',
+
+            86: 'telephone',
+
+            87: 'television',
+
+            88: 'tiger',
+
+            89: 'tractor',
+
+            90: 'train',
+
+            91: 'trout',
+
+            92: 'tulip',
+
+            93: 'turtle',
+
+            94: 'wardrobe',
+
+            95: 'whale',
+
+            96: 'willow tree',
+
+            97: 'wolf',
+
+            98: 'woman',
+
+            99: 'worm',
+        }
+        self.build_captions()
+
+    def build_captions(self):
+        self.captions = [self.fine_label_translation_table[f] for f in self.fine_captions]
+
+    def __len__(self):
+        return len(self.captions)
+
+    def __getitem__(self, idx):
+        images = utils.get_pixel_values_for_model(self.feature_extractor, self.images[idx])
+        tokenized_data = self.tokenizer(
+            self.captions[idx],
+            return_tensors="pt",
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_len)
+        tokens = tokenized_data.input_ids[0]
+        caption_len = tokenized_data.attention_mask[0].sum()
+        return images, tokens, caption_len, idx
+
+
+def get_cifar100_dataset(args, split: str, tokenizer) -> Dataset:
+    assert split in ['train', 'val'
+                     ], 'Expected split to be one of "train" or "val", got {split} instead.'
+    train = split == 'train'
+
+    if split == 'train':
+        dataset = load_dataset("cifar100", split="train")
+
+    elif split == 'val':
+        dataset = load_dataset("cifar100", split="test")
+
+    xxx = ImgDataset(dataset=dataset, tokenizer=tokenizer, feature_extractor_model=args.visual_model, train=train,
+                     max_len=args.max_len,
+                     image_size=args.image_size)
+    return xxx

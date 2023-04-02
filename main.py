@@ -52,16 +52,16 @@ def parse_args(args):
     parser.add_argument('--log-base-dir', default='./runs/', type=str,
                         help='Base directory to write logs and ckpts to.')
 
-    parser.add_argument('--exp_name', default='un_norm_fp32_clean', type=str,
+    parser.add_argument('--exp_name', default='cifar_100', type=str,
                         help='Name of experiment, used for saving checkpoints.')
 
     parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
 
-    parser.add_argument('--epochs', default=20, type=int, metavar='N',
+    parser.add_argument('--epochs', default=100, type=int, metavar='N',
                         help='number of total epochs to run')
 
-    parser.add_argument('--steps-per-epoch', default=196, type=int, metavar='N',
+    parser.add_argument('--steps-per-epoch', default=19, type=int, metavar='N',
                         help='number of training steps per epoch')
 
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
@@ -70,7 +70,7 @@ def parse_args(args):
     parser.add_argument('--val-steps-per-epoch', default=-1, type=int, metavar='N',
                         help='number of validation steps per epoch.')
 
-    parser.add_argument('-b', '--batch-size', default=128, type=int,
+    parser.add_argument('-b', '--batch-size', default=100, type=int,
                         metavar='N',
                         help='mini-batch size (default: 180), this is the total '
                              'batch size of all GPUs on the current node when '
@@ -81,21 +81,21 @@ def parse_args(args):
     parser.add_argument('--lr', '--learning-rate', default=0.001, type=float,
                         metavar='LR', help='initial learning rate', dest='lr')
 
-    parser.add_argument('--lr-warmup-steps', default=196, type=int,
+    parser.add_argument('--lr-warmup-steps', default=5, type=int,
                         metavar='N', help='Number of steps to warm up lr.')
 
-    parser.add_argument('--lr-schedule-step-size', default=5, type=int,
+    parser.add_argument('--lr-schedule-step-size', default=100, type=int,
                         metavar='N', help='Number of epochs between decaying lr.')
 
     parser.add_argument('--lr-schedule-gamma', default=0.1, type=float,
                         metavar='N', help='Decay parameter for learning rate scheduler.')
 
-    parser.add_argument('--grad-accumulation-steps', default=2, type=int, metavar='N',
+    parser.add_argument('--grad-accumulation-steps', default=1, type=int, metavar='N',
                         help='number of gradient accumulation steps')
 
     parser.add_argument('--grad-clip', default=-1.0, type=float, help='gradient clipping amount')
 
-    parser.add_argument('--precision', default='fp16', type=str, choices=['fp32', 'fp16', 'bf16'],
+    parser.add_argument('--precision', default='fp32', type=str, choices=['fp32', 'fp16', 'bf16'],
                         help="Precision to train in.")
 
     parser.add_argument('--cap-loss-scale', type=float, default=1.0, help="Scale on captioning loss.")
@@ -141,9 +141,8 @@ def parse_args(args):
     parser.add_argument('--wd', '--weight-decay', default=0.001, type=float,
                         metavar='W', help='weight decay (default: 0.0)', dest='weight_decay')
 
-    parser.add_argument('-p', '--print-freq', default=30, type=int,
+    parser.add_argument('-p', '--print-freq', default=1, type=int,
                         metavar='N', help='print frequency (default: 10)')
-
 
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                         help='evaluate model on validation set')
@@ -174,7 +173,7 @@ def parse_args(args):
                              'N processes per node, which has N GPUs. This is the '
                              'fastest way to use PyTorch for either single node or '
                              'multi node data parallel training')
-    parser.add_argument('--gamma_neg', default=4, type=int,
+    parser.add_argument('--gamma_neg', default=1, type=int,
                         help='Scale of negative example impact in assymetric entropy loss')
     parser.add_argument('--gamma_pos', default=1, type=int,
                         help='Scale of positive example impact in assymetric entropy loss')
@@ -294,6 +293,8 @@ def main_worker(gpu, ngpus_per_node, args):
         eps=1e-8
     )
 
+    scaler = torch.cuda.amp.GradScaler()
+
     """Sets the learning rate to the initial LR decayed by 10 every 5 epochs"""
     scheduler_steplr = StepLR(optimizer,
                               step_size=args.lr_schedule_step_size * args.steps_per_epoch,
@@ -350,8 +351,11 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     # Data loading code
-    train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=50_000)
-    val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=10_000)
+
+    # train_dataset = data.get_dataset(args, 'train', tokenizer, max_items=50_000)
+    # val_dataset = data.get_dataset(args, 'val', tokenizer, max_items=10_000)
+    train_dataset = data.get_cifar100_dataset(args, 'train', tokenizer)
+    val_dataset = data.get_cifar100_dataset(args, 'val', tokenizer)
     print(f'Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples.')
 
     if args.distributed:
@@ -383,14 +387,17 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # Train for one epoch
         print(f"Performing Training Epoch: {epoch}")
-        train(train_loader, model, optimizer, epoch, scheduler, args)
+        train(train_loader, model, optimizer, epoch, scheduler,scaler, args)
 
         # Evaluate on validation set
-        eval_loss, eval_accs = evaluate(val_loader, model, args, epoch)
+        is_best = False
+        best_score = -1
+        if epoch % 3 == 2:
+            eval_loss, eval_accs = evaluate(val_loader, model, args, epoch)
 
-        # remember best score and save checkpoint
-        is_best = eval_loss > best_score
-        best_score = max(eval_loss, best_score)
+            # remember best score and save checkpoint
+            is_best = eval_loss > best_score
+            best_score = max(eval_loss, best_score)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
@@ -403,7 +410,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best, os.path.join(args.log_dir, 'ckpt'))
 
 
-def train(train_loader, model, optimizer, epoch, scheduler, args):
+def train(train_loader, model, optimizer, epoch, scheduler, scaler, args):
     """Main training loop."""
     ngpus_per_node = torch.cuda.device_count()
     batch_time = utils.AverageMeter('Time', ':6.3f')
@@ -428,73 +435,75 @@ def train(train_loader, model, optimizer, epoch, scheduler, args):
         actual_step = epoch * args.steps_per_epoch + i + 1
         data_time.update(time.time() - start)
 
-        if torch.cuda.is_available():
+        with torch.cuda.amp.autocast(dtype=torch.float16):
             images = images.cuda(args.gpu, non_blocking=True)
-            # tokens = tokens.cuda(args.gpu, non_blocking=True)
 
-        visual_embs, logits, loss = model(images=images,
-                                          labels=tokens,
-                                          tensors=None,
-                                          mode='no_projection')
+            visual_embs, _, logits, loss = model(images=images,
+                                                 labels=tokens,
+                                                 tensors=None,
+                                                 mode='no_projection')
 
-        acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
-                                           tokens.detach().cpu().float(),
-                                           -100, topk=(1, 5, 24))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
-        top24.update(acc24[0], images.size(0))
+            acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
+                                               tokens.detach().cpu().float(),
+                                               -100, topk=(1, 5, 24))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+            top24.update(acc24[0], images.size(0))
 
-        loss = loss / args.grad_accumulation_steps
-        losses.update(loss.item(), images.size(0))
-        loss.backward()
+            loss = loss / args.grad_accumulation_steps
+            losses.update(loss.item(), images.size(0))
+            scaler.scale(loss).backward()
 
-        if ((i + 1) % args.grad_accumulation_steps == 0) or (i == args.steps_per_epoch - 1):
-            # compute gradient and do SGD step
-            if args.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad()
-        batch_time.update(time.time() - start)
+            if ((i + 1) % args.grad_accumulation_steps == 0) or (i == args.steps_per_epoch - 1):
+                # compute gradient and do SGD step
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-        if actual_step == 1 or (i + 1) % args.print_freq == 0:
-            ex_per_sec = args.batch_size / batch_time.avg
-            if args.distributed:
-                batch_time.all_reduce()
-                data_time.all_reduce()
-                ex_per_sec = (args.batch_size / batch_time.avg) * ngpus_per_node
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            batch_time.update(time.time() - start)
 
-                losses.all_reduce()
-                top1.all_reduce()
-                top5.all_reduce()
-                cap_time.all_reduce()
+            if actual_step == 1 or (i + 1) % args.print_freq == 0:
+                ex_per_sec = args.batch_size / batch_time.avg
+                if args.distributed:
+                    batch_time.all_reduce()
+                    data_time.all_reduce()
+                    ex_per_sec = (args.batch_size / batch_time.avg) * ngpus_per_node
 
-            progress.display(i + 1)
+                    losses.all_reduce()
+                    top1.all_reduce()
+                    top5.all_reduce()
+                    cap_time.all_reduce()
 
-            writer.add_scalar('train/loss', losses.avg, actual_step)
-            writer.add_scalar('train/seq_top1_acc', top1.avg, actual_step)
-            writer.add_scalar('train/seq_top5_acc', top5.avg, actual_step)
-            writer.add_scalar('train/seq_top24_acc', top24.avg, actual_step)
-            writer.add_scalar('metrics/total_secs_per_batch', batch_time.avg, actual_step)
-            writer.add_scalar('metrics/total_secs_captioning', cap_time.avg, actual_step)
-            writer.add_scalar('metrics/data_secs_per_batch', data_time.avg, actual_step)
-            writer.add_scalar('metrics/examples_per_sec', ex_per_sec, actual_step)
+                progress.display(i + 1)
 
-            batch_time.reset()
-            cap_time.reset()
-            data_time.reset()
-            losses.reset()
-            top1.reset()
-            top5.reset()
+                writer.add_scalar('train/loss', losses.avg, actual_step)
+                writer.add_scalar('train/seq_top1_acc', top1.avg, actual_step)
+                writer.add_scalar('train/seq_top5_acc', top5.avg, actual_step)
+                writer.add_scalar('train/seq_top24_acc', top24.avg, actual_step)
+                writer.add_scalar('metrics/total_secs_per_batch', batch_time.avg, actual_step)
+                writer.add_scalar('metrics/total_secs_captioning', cap_time.avg, actual_step)
+                writer.add_scalar('metrics/data_secs_per_batch', data_time.avg, actual_step)
+                writer.add_scalar('metrics/examples_per_sec', ex_per_sec, actual_step)
 
-        if i == args.steps_per_epoch - 1:
-            break
+                batch_time.reset()
+                cap_time.reset()
+                data_time.reset()
+                losses.reset()
+                top1.reset()
+                top5.reset()
 
-        scheduler.step()
-        curr_lr = optimizer.param_groups[0]['lr']
-        if (actual_step == 1) or (i + 1) % args.print_freq == 0:
-            writer = SummaryWriter(args.log_dir)
-            writer.add_scalar('train/lr', curr_lr, actual_step)
-            writer.close()
+            if i == args.steps_per_epoch - 1:
+                break
+
+            scheduler.step()
+            curr_lr = optimizer.param_groups[0]['lr']
+            if (actual_step == 1) or (i + 1) % args.print_freq == 0:
+                writer = SummaryWriter(args.log_dir)
+                writer.add_scalar('train/lr', curr_lr, actual_step)
+                writer.close()
 
     writer.close()
 
@@ -510,23 +519,24 @@ def evaluate(val_loader, model, args, epoch):
     model.eval()
 
     with torch.no_grad():
-        for i, (images, tokens, caption_len, image_index) in enumerate(val_loader):
-            if torch.cuda.is_available():
-                images = images.cuda(args.gpu, non_blocking=True)
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            for i, (images, tokens, caption_len, image_index) in enumerate(val_loader):
+                if torch.cuda.is_available():
+                    images = images.cuda(args.gpu, non_blocking=True)
 
-            visual_embs, logits, loss = model(images=images,
-                                              labels=tokens,
-                                              tensors=None,
-                                              mode='no_projection')
+                visual_embs, _, logits, loss = model(images=images,
+                                                     labels=tokens,
+                                                     tensors=None,
+                                                     mode='no_projection')
 
-            acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
-                                               tokens.detach().cpu().float(),
-                                               -100, topk=(1, 5, 24))
+                acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
+                                                   tokens.detach().cpu().float(),
+                                                   -100, topk=(1, 5, 24))
 
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-            top24.update(acc24[0], images.size(0))
-            losses.update(loss.item(), images.size(0))
+                top1.update(acc1[0], images.size(0))
+                top5.update(acc5[0], images.size(0))
+                top24.update(acc24[0], images.size(0))
+                losses.update(loss.item(), images.size(0))
 
     if args.distributed:
         losses.all_reduce()
@@ -564,7 +574,6 @@ def inspect(val_loader, model, args, tokenizer):
             print(f"Caption: {bd}\n")
             print(f"Model BOW: {mbd}\n")
             print(f"Acc@1:{acc1} /Acc@5:{acc5} / Acc@24:{acc24}")
-
 
     return
 

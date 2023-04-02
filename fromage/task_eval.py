@@ -330,12 +330,12 @@ def main(args):
     args.retrieval_token_idx = ret_token_idx[0]
 
     model = TLTLModel(tokenizer, model_args)
-    checkpoint = torch.load('../runs/frozen/ckpt_best.pth.tar')
-    new_checkpoint = {'state_dict': {}}
-    for param_name, value in checkpoint['state_dict'].items():
-        new_name = '.'.join(param_name.split('.')[1:])
-        new_checkpoint['state_dict'].update({new_name: value})
-    model.load_state_dict(new_checkpoint['state_dict'])
+    # checkpoint = torch.load('../runs/frozen/ckpt_best.pth.tar')
+    # new_checkpoint = {'state_dict': {}}
+    # for param_name, value in checkpoint['state_dict'].items():
+    #     new_name = '.'.join(param_name.split('.')[1:])
+    #     new_checkpoint['state_dict'].update({new_name: value})
+    # model.load_state_dict(new_checkpoint['state_dict'])
     model.float()
     model.cuda()
     model.custom_eval()

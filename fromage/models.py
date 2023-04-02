@@ -6,9 +6,11 @@ import torch.nn as nn
 import copy
 from transformers import OPTForCausalLM, GPT2Tokenizer
 from transformers import CLIPVisionModel
-from fromage.losses import AsymmetricLossOptimized
+from fromage.losses import AsymmetricLossOptimized, RelaxedListMLE
 from fromage import utils
 import torch.nn.functional as F
+import os
+import random
 
 
 class FrozenArgs:
@@ -542,12 +544,11 @@ class TLTLModel(nn.Module):
         print(f"Using {visual_encoder} for the VM with {n_visual_tokens} visual tokens.")
         print("[Step 1]: Restoring the LM...\n")
         self.opt_version = opt_version
-        self.lm = OPTForCausalLM.from_pretrained(opt_version, torch_dtype=torch.float16)
+        self.lm = OPTForCausalLM.from_pretrained(opt_version)
         print("[Step 2]: Extracting the Unembed Layer... \n")
         self.unembed = copy.deepcopy(self.lm.lm_head)
         print("[Step 3]: Freezing the Unembed Layer... \n")
         self.unembed.eval()
-        self.unembed.float()
         for param in self.unembed.parameters():
             param.requires_grad = False
         self.lm = None
@@ -557,7 +558,6 @@ class TLTLModel(nn.Module):
         print("[Step 4]: Restoring the VM...\n")
         self.visual_model_name = visual_encoder
         self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder)
-
         visual_hidden_size = self.visual_model.config.hidden_size
         print("[Step 5]: Freezing the VM... \n")
         self.visual_model.eval()
@@ -567,12 +567,14 @@ class TLTLModel(nn.Module):
         embedding_dim = language_hidden_size * self.args.n_visual_tokens
         self.visual_embeddings = nn.Linear(visual_hidden_size, embedding_dim, bias=True)
 
-        self.post_visual_embeddings_normalization = nn.LayerNorm(normalized_shape=language_hidden_size,
+        self.post_visual_embeddings_normalization = nn.LayerNorm(normalized_shape=embedding_dim,
                                                                  elementwise_affine=True)
-
+        self.reduce = nn.Linear(embedding_dim, embedding_dim, bias=True)
         self.gamma_neg = self.args.gamma_neg if self.args.gamma_neg is not None else 4
         self.gamma_pos = self.args.gamma_pos if self.args.gamma_pos is not None else 1
-        self.loss_fn = AsymmetricLossOptimized(gamma_neg=self.gamma_neg, gamma_pos=self.gamma_pos)
+        # self.loss_fn = AsymmetricLossOptimized(gamma_neg=self.gamma_neg, gamma_pos=self.gamma_pos)
+        self.loss_fn = RelaxedListMLE()
+        self.train()
 
     def get_visual_embs(self,
                         pixel_values: torch.FloatTensor,
@@ -600,12 +602,18 @@ class TLTLModel(nn.Module):
         for param in self.unembed.parameters():
             param.requires_grad = False
         self.visual_model.eval()
+        for param in self.visual_model.parameters():
+            param.requires_grad = False
         self.visual_embeddings.train()
         self.post_visual_embeddings_normalization.train()
 
     def custom_eval(self):
         self.unembed.eval()
+        for param in self.unembed.parameters():
+            param.requires_grad = False
         self.visual_model.eval()
+        for param in self.visual_model.parameters():
+            param.requires_grad = False
         self.visual_embeddings.eval()
         self.post_visual_embeddings_normalization.eval()
 
@@ -615,10 +623,19 @@ class TLTLModel(nn.Module):
                                self.active_vocab_size,
                                device=y.device).scatter_(1, y, torch.ones(batch_size,
                                                                           self.active_vocab_size, device=y.device))
-        sparse_y[:, 0] = 0
-        sparse_y[:, 1] = 0
-        sparse_y[:, 2] = 0
-        loss = self.loss_fn(x, sparse_y)
+        minus_y = -1 * torch.ones(batch_size,
+                                  self.active_vocab_size,
+                                  device=y.device).scatter_(1, torch.randint(low=0, high=self.active_vocab_size,
+                                                                             size=(batch_size, 100), device=y.device),
+                                                            torch.zeros(batch_size,
+                                                                        self.active_vocab_size, device=y.device))
+
+        minus_y *= 1 - sparse_y
+        minus_y += sparse_y
+        minus_y[:, 0] = -1
+        minus_y[:, 1] = -1
+        minus_y[:, 2] = -1
+        loss = self.loss_fn(x, minus_y)
         return loss
 
     def forward(self,
@@ -637,18 +654,18 @@ class TLTLModel(nn.Module):
 
         ### Part 2: Project it and transform it ###
         visual_embs = self.visual_embeddings(visual_embs)
-        visual_embs = self.post_visual_embeddings_normalization(visual_embs)
 
-        ### Part 3: Use the Unembedding Layer to translate into the LM-Space ###
+
+        ### Part 4: Use the Unembedding Layer to translate into the logits ###
         logits = self.unembed(visual_embs)
 
-        ### Part 4: Calculate the Loss ###
+        ### Part 5: Calculate the Loss ###
         if labels is not None:
             assert labels.shape[0] == batch_size
             loss = self.calc_loss_(logits, labels)
         else:
             loss = None
-        return visual_embs, logits, loss
+        return visual_embs, None, logits, loss
 
 
 def load_tltl(model_dir: str) -> TLTLModel:
@@ -686,23 +703,3 @@ def load_tltl(model_dir: str) -> TLTLModel:
     #     model.model.input_embeddings.weight[model.model.retrieval_token_idx, :].copy_(
     #         checkpoint['state_dict']['ret_input_embeddings.weight'].cpu().detach())
     return model
-
-
-if __name__ == '__main__':
-    import os
-
-    print(os.listdir())
-    model_dir = '../fromage_model/'
-    model_args_path = os.path.join(model_dir, 'model_args.json')
-    with open(model_args_path, 'r') as f:
-        model_kwargs = json.load(f)
-    tokenizer = GPT2Tokenizer.from_pretrained(model_kwargs['opt_version'])
-    tokenizer.pad_token = tokenizer.eos_token
-    # Add special tokens to the model to enable [RET].
-    tokenizer.add_special_tokens({"cls_token": "<|image|>"})
-    tokenizer.add_tokens('[RET]')
-    ret_token_idx = tokenizer('[RET]', add_special_tokens=False).input_ids
-    assert len(ret_token_idx) == 1, ret_token_idx
-    model_kwargs['retrieval_token_idx'] = ret_token_idx[0]
-    args = namedtuple('args', model_kwargs)(**model_kwargs)
-    empty = TLTLModel(tokenizer=tokenizer, args=args)
