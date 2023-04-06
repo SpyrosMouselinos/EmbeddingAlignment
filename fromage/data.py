@@ -3,6 +3,7 @@ import logging
 import os
 import numpy as np
 import pandas as pd
+import torchvision
 from PIL import Image
 from torch.utils.data import Dataset
 import torch
@@ -13,6 +14,7 @@ from nltk.tokenize import word_tokenize
 import string
 from nltk.corpus import stopwords
 from datasets import load_dataset
+import random
 
 STOP_WORDS = set(stopwords.words('english'))
 PUNC_TABLE = str.maketrans('', '', string.punctuation)
@@ -196,18 +198,28 @@ class CsvDataset(Dataset):
                 idx = np.random.randint(0, len(self) - 1)
 
 
+def isvowel(letter):
+    vowels = ['a', 'e', 'i', 'o', 'u']
+    cap_vowels = ['A', 'E', 'I', 'O', 'u']
+    if letter in vowels or letter in cap_vowels:
+        return True
+    else:
+        return False
+
+
 class ImgDataset(Dataset):
     def __init__(self,
                  dataset,
                  tokenizer,
                  feature_extractor_model: str,
                  train: bool = True,
-                 max_len: int = 32,
-                 image_size: int = 224):
+                 max_len: int = 24,
+                 image_size: int = 224,
+                 return_og_image=False):
         self.max_img_index = len(dataset) - 1
         self.max_items = len(dataset)
-        self.images = dataset['img'][:1_000]
-        self.fine_captions = dataset['fine_label'][:1_000]
+        self.images = dataset['img']
+        self.fine_captions = dataset['fine_label']
 
         self.training_mode = 'training' if train else 'validation'
 
@@ -419,38 +431,61 @@ class ImgDataset(Dataset):
             99: 'worm',
         }
         self.build_captions()
+        self.return_og_image = return_og_image
 
     def build_captions(self):
-        self.captions = [self.fine_label_translation_table[f] for f in self.fine_captions]
+        # self.captions = [' ' + self.fine_label_translation_table[f] for f in self.fine_captions]
+        self.no_space_captions = [' ' + self.fine_label_translation_table[f] for f in self.fine_captions]
+        self.no_space_captions = ['n ' + f if isvowel(f) else f for f in self.no_space_captions]
 
     def __len__(self):
-        return len(self.captions)
+        return len(self.no_space_captions)
 
     def __getitem__(self, idx):
         images = utils.get_pixel_values_for_model(self.feature_extractor, self.images[idx])
+        # # Captions #
+        # tokenized_data = self.tokenizer(
+        #     self.captions[idx],
+        #     return_tensors="pt",
+        #     padding='max_length',
+        #     truncation=True,
+        #     max_length=self.max_len)
+        # caption_len_1 = tokenized_data.attention_mask[0][1:2].sum()
+        # tokens_1 = tokenized_data.input_ids[0][1:2]
+
+        # No space Captions #
         tokenized_data = self.tokenizer(
-            self.captions[idx],
+            self.no_space_captions[idx],
             return_tensors="pt",
             padding='max_length',
             truncation=True,
-            max_length=self.max_len)
-        tokens = tokenized_data.input_ids[0]
-        caption_len = tokenized_data.attention_mask[0].sum()
-        return images, tokens, caption_len, idx
+            max_length=self.max_len, add_special_tokens=False)
+        caption_len_2 = tokenized_data.attention_mask[0].sum()
+        tokens_2 = tokenized_data.input_ids[0]
+
+        # tokens = torch.cat([tokens_1, tokens_2], dim=0)
+        tokens = tokens_2
+        # caption_len = caption_len_1 + caption_len_2
+        caption_len = caption_len_2
+        if self.return_og_image:
+            return torchvision.transforms.PILToTensor()(self.images[idx]), images, tokens, caption_len, idx
+        else:
+            return images, tokens, caption_len, idx
 
 
-def get_cifar100_dataset(args, split: str, tokenizer) -> Dataset:
+def get_cifar100_dataset(args, split: str, tokenizer, return_og_image=False) -> Dataset:
     assert split in ['train', 'val'
                      ], 'Expected split to be one of "train" or "val", got {split} instead.'
     train = split == 'train'
 
     if split == 'train':
         dataset = load_dataset("cifar100", split="train")
+        dataset = dataset.train_test_split(test_size=0.5, stratify_by_column="fine_label")['train']
 
     elif split == 'val':
-        dataset = load_dataset("cifar100", split="test")
+        dataset = load_dataset("cifar100", split="test")[:5000]
 
     xxx = ImgDataset(dataset=dataset, tokenizer=tokenizer, feature_extractor_model=args.visual_model, train=train,
                      max_len=args.max_len,
-                     image_size=args.image_size)
+                     image_size=args.image_size, return_og_image=return_og_image)
     return xxx

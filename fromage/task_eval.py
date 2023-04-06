@@ -13,7 +13,12 @@ import argparse
 from fromage.models import TLTLModel, FrozenArgs, LLMGENWrapper
 from fromage import utils, data
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import matplotlib.pyplot as plt
+from torchvision.transforms import ToPILImage
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 
+mpl.use('TkAgg')  # !IMPORTANT
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 visual_models = ['openai/clip-vit-large-patch14', 'openai/clip-vit-large-patch14-336']
 llm_models = ['facebook/opt-125m', 'facebook/opt-350m', 'facebook/opt-1.3b',
@@ -96,7 +101,7 @@ def parse_args(args):
     parser.add_argument('--concat-for-ret', action='store_true', default=False,
                         help="Whether to concatenate examples for retrieval mode.")
 
-    parser.add_argument('--input-prompt_pre', default='Image:', type=str,
+    parser.add_argument('--input-prompt_pre', default=None, type=str,
                         help="Input prompt for the language model, if any.")
 
     parser.add_argument('--input-prompt_post', default='This is an image of', type=str,
@@ -169,9 +174,9 @@ def parse_args(args):
                              'N processes per node, which has N GPUs. This is the '
                              'fastest way to use PyTorch for either single node or '
                              'multi node data parallel training')
-    parser.add_argument('--gamma_neg', default=4, type=int,
+    parser.add_argument('--gamma_neg', default=0, type=int,
                         help='Scale of negative example impact in assymetric entropy loss')
-    parser.add_argument('--gamma_pos', default=1, type=int,
+    parser.add_argument('--gamma_pos', default=0, type=int,
                         help='Scale of positive example impact in assymetric entropy loss')
 
     return parser.parse_args(args)
@@ -182,7 +187,7 @@ def run_validate(val_loader, tokenizer, model, lm_model, args, progress):
         all_generated_captions = []
         all_gt_captions = []
 
-        for i, (images, tokens, caption_len, image_index) in tqdm.tqdm(enumerate(val_loader),
+        for i, (og_img, images, tokens, caption_len, image_index) in tqdm.tqdm(enumerate(val_loader),
                                                                        position=0,
                                                                        total=len(val_loader)):
 
@@ -191,24 +196,31 @@ def run_validate(val_loader, tokenizer, model, lm_model, args, progress):
                 caption_len = caption_len.cuda(args.gpu, non_blocking=True)
                 images = images.cuda(args.gpu, non_blocking=True)
 
-            visual_embs, logits, _ = model(images=images, labels=None, tensors=None)
-            prompt_ids_pre = lm_model.tokenizer(args.input_prompt_pre,
-                                                add_special_tokens=True,
-                                                return_tensors="pt").input_ids
+            visual_embs, _, logits, _ = model(images=images, labels=None, tensors=None)
+            emb_list = []
+            if args.input_prompt_pre is not None:
+                prompt_ids_pre = lm_model.tokenizer(args.input_prompt_pre,
+                                                    add_special_tokens=True,
+                                                    return_tensors="pt").input_ids
 
-            prompt_ids_pre = prompt_ids_pre.to(visual_embs.device)
-            prompt_embs_pre = lm_model.input_embeddings(prompt_ids_pre)
-            prompt_embs_pre = prompt_embs_pre.repeat(visual_embs.shape[0], 1, 1)
+                prompt_ids_pre = prompt_ids_pre.to(visual_embs.device)
+                prompt_embs_pre = lm_model.input_embeddings(prompt_ids_pre)
+                prompt_embs_pre = prompt_embs_pre.repeat(visual_embs.shape[0], 1, 1)
+                emb_list.append(prompt_embs_pre)
+            #####
+            emb_list.append(visual_embs.unsqueeze(1))
+            #####
+            if args.input_prompt_post is not None:
+                prompt_ids_post = lm_model.tokenizer(args.input_prompt_post,
+                                                     add_special_tokens=args.input_prompt_pre is None,
+                                                     return_tensors="pt").input_ids
 
-            prompt_ids_post = lm_model.tokenizer(args.input_prompt_post,
-                                                 add_special_tokens=False,
-                                                 return_tensors="pt").input_ids
+                prompt_ids_post = prompt_ids_post.to(visual_embs.device)
+                prompt_embs_post = lm_model.input_embeddings(prompt_ids_post)
+                prompt_embs_post = prompt_embs_post.repeat(visual_embs.shape[0], 1, 1)
+                emb_list.append(prompt_embs_post)
 
-            prompt_ids_post = prompt_ids_post.to(visual_embs.device)
-            prompt_embs_post = lm_model.input_embeddings(prompt_ids_post)
-            prompt_embs_post = prompt_embs_post.repeat(visual_embs.shape[0], 1, 1)
-
-            input_embs = torch.cat([prompt_embs_pre, visual_embs.unsqueeze(1), prompt_embs_post], dim=1)
+            input_embs = torch.cat(emb_list, dim=1)
 
             ##########################################################################################################
 
@@ -228,7 +240,9 @@ def run_validate(val_loader, tokenizer, model, lm_model, args, progress):
             caption = lm_model.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
             return_outputs.append(caption)
             print(return_outputs)
-
+            plt.figure(figsize=(12,12))
+            ToPILImage()(og_img[0, :]).show()
+            plt.close()
             if i % args.print_freq == 0:
                 progress.display(i + 1)
 
@@ -294,7 +308,6 @@ def captioning_evaluation(step, val_loader, model, lm_model, tokenizer, args):
 
 
 def main(args):
-
     args = parse_args(args)
     i = 1
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
@@ -330,13 +343,12 @@ def main(args):
     args.retrieval_token_idx = ret_token_idx[0]
 
     model = TLTLModel(tokenizer, model_args)
-    # checkpoint = torch.load('../runs/frozen/ckpt_best.pth.tar')
-    # new_checkpoint = {'state_dict': {}}
-    # for param_name, value in checkpoint['state_dict'].items():
-    #     new_name = '.'.join(param_name.split('.')[1:])
-    #     new_checkpoint['state_dict'].update({new_name: value})
-    # model.load_state_dict(new_checkpoint['state_dict'])
-    model.float()
+    checkpoint = torch.load('../runs/full_model_fp32_assymetric_pos0_neg0/ckpt_best.pth.tar')
+    new_checkpoint = {'state_dict': {}}
+    for param_name, value in checkpoint['state_dict'].items():
+        new_name = '.'.join(param_name.split('.')[1:])
+        new_checkpoint['state_dict'].update({new_name: value})
+    model.load_state_dict(new_checkpoint['state_dict'])
     model.cuda()
     model.custom_eval()
 
@@ -344,7 +356,7 @@ def main(args):
     wrapped_lm_model = LLMGENWrapper(lm_model, tokenizer)
     wrapped_lm_model.cuda()
     wrapped_lm_model.eval()
-    test_dataset = data.get_dataset(args, 'val', tokenizer, max_items=50)
+    test_dataset = data.get_cifar100_dataset(args, 'val', tokenizer, return_og_image=True)
     print(f'Testing with {len(test_dataset)} examples.')
 
     test_loader = torch.utils.data.DataLoader(

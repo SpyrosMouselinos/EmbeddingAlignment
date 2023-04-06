@@ -28,13 +28,14 @@ llm_models = ['facebook/opt-125m', 'facebook/opt-350m', 'facebook/opt-1.3b',
               'facebook/opt-2.7b', 'facebook/opt-6.7b']
 datasets = ['cc3m']
 best_score = 0
+GLOBAL_DTYPE = torch.float16
 
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description='TLTL Trainer')
-    parser.add_argument('--opt-version', default='facebook/opt-125m')
+    parser.add_argument('--opt-version', default='facebook/opt-1.3b')
     parser.add_argument('--inspect', action='store_true', default=False)
-    parser.add_argument('--resume', default='', type=str, metavar='PATH',
+    parser.add_argument('--resume', default=None, type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
     parser.add_argument('--visual-model',
                         default='openai/clip-vit-large-patch14',
@@ -52,16 +53,16 @@ def parse_args(args):
     parser.add_argument('--log-base-dir', default='./runs/', type=str,
                         help='Base directory to write logs and ckpts to.')
 
-    parser.add_argument('--exp_name', default='cifar_100', type=str,
+    parser.add_argument('--exp_name', default='mixed_2_layer_multiple_representations_1_3b', type=str,
                         help='Name of experiment, used for saving checkpoints.')
 
     parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
 
-    parser.add_argument('--epochs', default=100, type=int, metavar='N',
+    parser.add_argument('--epochs', default=50, type=int, metavar='N',
                         help='number of total epochs to run')
 
-    parser.add_argument('--steps-per-epoch', default=19, type=int, metavar='N',
+    parser.add_argument('--steps-per-epoch', default=50, type=int, metavar='N',
                         help='number of training steps per epoch')
 
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
@@ -76,15 +77,15 @@ def parse_args(args):
                              'batch size of all GPUs on the current node when '
                              'using Data Parallel or Distributed Data Parallel')
 
-    parser.add_argument('--val-batch-size', default=None, type=int)
+    parser.add_argument('--val_batch_size', default=100, type=int)
 
-    parser.add_argument('--lr', '--learning-rate', default=0.001, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=0.005, type=float,
                         metavar='LR', help='initial learning rate', dest='lr')
 
-    parser.add_argument('--lr-warmup-steps', default=5, type=int,
+    parser.add_argument('--lr-warmup-steps', default=100, type=int,
                         metavar='N', help='Number of steps to warm up lr.')
 
-    parser.add_argument('--lr-schedule-step-size', default=100, type=int,
+    parser.add_argument('--lr-schedule-step-size', default=15, type=int,
                         metavar='N', help='Number of epochs between decaying lr.')
 
     parser.add_argument('--lr-schedule-gamma', default=0.1, type=float,
@@ -93,7 +94,7 @@ def parse_args(args):
     parser.add_argument('--grad-accumulation-steps', default=1, type=int, metavar='N',
                         help='number of gradient accumulation steps')
 
-    parser.add_argument('--grad-clip', default=-1.0, type=float, help='gradient clipping amount')
+    parser.add_argument('--grad-clip', default=-1, type=float, help='gradient clipping amount')
 
     parser.add_argument('--precision', default='fp32', type=str, choices=['fp32', 'fp16', 'bf16'],
                         help="Precision to train in.")
@@ -130,7 +131,7 @@ def parse_args(args):
                         default='-1',
                         type=lambda s: [int(x) for x in s.split(',')])
 
-    parser.add_argument('--max-len', default=24, type=int,
+    parser.add_argument('--max-len', default=5, type=int,
                         metavar='N', help='Maximum length to truncate captions / generations to.')
 
     parser.add_argument('--n-visual-tokens', default=1, type=int,
@@ -173,9 +174,9 @@ def parse_args(args):
                              'N processes per node, which has N GPUs. This is the '
                              'fastest way to use PyTorch for either single node or '
                              'multi node data parallel training')
-    parser.add_argument('--gamma_neg', default=1, type=int,
+    parser.add_argument('--gamma_neg', default=0, type=int,
                         help='Scale of negative example impact in assymetric entropy loss')
-    parser.add_argument('--gamma_pos', default=1, type=int,
+    parser.add_argument('--gamma_pos', default=0, type=int,
                         help='Scale of positive example impact in assymetric entropy loss')
 
     return parser.parse_args(args)
@@ -286,8 +287,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     optimizer = torch.optim.AdamW(
         params=[
-            {'params': model.visual_embeddings.parameters(), 'lr': args.lr, 'weight_decay': args.weight_decay},
-            {'params': model.post_visual_embeddings_normalization.parameters(), 'lr': args.lr, 'weight_decay': 0}
+            {'params': model.visual_embeddings.parameters(), 'lr': args.lr, 'weight_decay': args.weight_decay}
         ],
         betas=(args.beta1, args.beta2),
         eps=1e-8
@@ -326,7 +326,12 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
     else:
-        model = torch.nn.DataParallel(model).cuda()
+        pass
+        # REMOVE THIS IF NOT ON MY PC #
+        # TODO: REMOVE THIS
+        # torch.cuda.set_device(-1)
+        model = torch.nn.DataParallel(model)
+        # torch.cuda.set_device(0)
 
     if args.resume:
         if os.path.exists(args.resume):
@@ -342,7 +347,7 @@ def main_worker(gpu, ngpus_per_node, args):
             if args.gpu is not None:
                 # best_score may be from a checkpoint from a different GPU
                 best_score = best_score.to(args.gpu)
-            model.load_state_dict(checkpoint['state_dict'])
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -378,22 +383,28 @@ def main_worker(gpu, ngpus_per_node, args):
         return
     else:
         val_loader = torch.utils.data.DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False,
+            val_dataset, batch_size=args.val_batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-
+        print("\n Testing without FLM \n")
+        # _, _ = evaluate(val_loader, model, args, epoch, no_adapt_forward=False)
+        print("\n Testing with FLM \n")
+        # _, _ = evaluate(val_loader, model, args, epoch, no_adapt_forward=True)
         # Train for one epoch
         print(f"Performing Training Epoch: {epoch}")
-        train(train_loader, model, optimizer, epoch, scheduler,scaler, args)
+        train(train_loader, model, optimizer, epoch, scheduler, scaler, args)
 
         # Evaluate on validation set
         is_best = False
         best_score = -1
-        if epoch % 3 == 2:
-            eval_loss, eval_accs = evaluate(val_loader, model, args, epoch)
+        if epoch % 2 == 1:
+            print("\n Testing without FLM \n")
+            eval_loss, eval_accs = evaluate(val_loader, model, args, epoch, no_adapt_forward=False)
+            print("\n Testing with FLM \n")
+            # eval_loss, eval_accs = evaluate(val_loader, model, args, epoch, no_adapt_forward=True)
 
             # remember best score and save checkpoint
             is_best = eval_loss > best_score
@@ -429,109 +440,129 @@ def train(train_loader, model, optimizer, epoch, scheduler, scaler, args):
         prefix="Epoch: [{}]".format(epoch))
 
     model.train()
+    model.to(device='cuda')
     start = time.time()
 
     for i, (images, tokens, caption_len, image_index) in enumerate(train_loader):
         actual_step = epoch * args.steps_per_epoch + i + 1
         data_time.update(time.time() - start)
 
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.cuda.amp.autocast(dtype=GLOBAL_DTYPE):
             images = images.cuda(args.gpu, non_blocking=True)
 
-            visual_embs, _, logits, loss = model(images=images,
-                                                 labels=tokens,
-                                                 tensors=None,
-                                                 mode='no_projection')
+            _, _, logits, loss = model(images=images,
+                                       labels=tokens,
+                                       tensors=None,
+                                       mode='no_projection')
+            tokens = tokens[:, 0]
+            acc1, acc5, acc24 = utils.accuracy(logits.detach(),
+                                               tokens.detach(),
+                                               1, topk=(1, 5, 24))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+        top24.update(acc24[0], images.size(0))
 
-            acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
-                                               tokens.detach().cpu().float(),
-                                               -100, topk=(1, 5, 24))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-            top24.update(acc24[0], images.size(0))
+        loss = loss / args.grad_accumulation_steps
+        losses.update(loss.item(), images.size(0))
+        scaler.scale(loss).backward()
 
-            loss = loss / args.grad_accumulation_steps
-            losses.update(loss.item(), images.size(0))
-            scaler.scale(loss).backward()
+        if ((i + 1) % args.grad_accumulation_steps == 0) or (i == args.steps_per_epoch - 1):
+            # compute gradient and do SGD step
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            if ((i + 1) % args.grad_accumulation_steps == 0) or (i == args.steps_per_epoch - 1):
-                # compute gradient and do SGD step
-                if args.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
             batch_time.update(time.time() - start)
 
-            if actual_step == 1 or (i + 1) % args.print_freq == 0:
-                ex_per_sec = args.batch_size / batch_time.avg
-                if args.distributed:
-                    batch_time.all_reduce()
-                    data_time.all_reduce()
-                    ex_per_sec = (args.batch_size / batch_time.avg) * ngpus_per_node
+        if actual_step == 1 or (i + 1) % args.print_freq == 0:
+            ex_per_sec = args.batch_size / batch_time.avg
+            if args.distributed:
+                batch_time.all_reduce()
+                data_time.all_reduce()
+                ex_per_sec = (args.batch_size / batch_time.avg) * ngpus_per_node
 
-                    losses.all_reduce()
-                    top1.all_reduce()
-                    top5.all_reduce()
-                    cap_time.all_reduce()
+                losses.all_reduce()
+                top1.all_reduce()
+                top5.all_reduce()
+                cap_time.all_reduce()
 
-                progress.display(i + 1)
+            progress.display(i + 1)
 
-                writer.add_scalar('train/loss', losses.avg, actual_step)
-                writer.add_scalar('train/seq_top1_acc', top1.avg, actual_step)
-                writer.add_scalar('train/seq_top5_acc', top5.avg, actual_step)
-                writer.add_scalar('train/seq_top24_acc', top24.avg, actual_step)
-                writer.add_scalar('metrics/total_secs_per_batch', batch_time.avg, actual_step)
-                writer.add_scalar('metrics/total_secs_captioning', cap_time.avg, actual_step)
-                writer.add_scalar('metrics/data_secs_per_batch', data_time.avg, actual_step)
-                writer.add_scalar('metrics/examples_per_sec', ex_per_sec, actual_step)
+            writer.add_scalar('train/loss', losses.avg, actual_step)
+            writer.add_scalar('train/seq_top1_acc', top1.avg, actual_step)
+            writer.add_scalar('train/seq_top5_acc', top5.avg, actual_step)
+            writer.add_scalar('train/seq_top24_acc', top24.avg, actual_step)
+            writer.add_scalar('metrics/total_secs_per_batch', batch_time.avg, actual_step)
+            writer.add_scalar('metrics/total_secs_captioning', cap_time.avg, actual_step)
+            writer.add_scalar('metrics/data_secs_per_batch', data_time.avg, actual_step)
+            writer.add_scalar('metrics/examples_per_sec', ex_per_sec, actual_step)
 
-                batch_time.reset()
-                cap_time.reset()
-                data_time.reset()
-                losses.reset()
-                top1.reset()
-                top5.reset()
+            batch_time.reset()
+            cap_time.reset()
+            data_time.reset()
+            losses.reset()
+            top1.reset()
+            top5.reset()
 
-            if i == args.steps_per_epoch - 1:
-                break
+        if i == args.steps_per_epoch - 1:
+            break
 
-            scheduler.step()
-            curr_lr = optimizer.param_groups[0]['lr']
-            if (actual_step == 1) or (i + 1) % args.print_freq == 0:
-                writer = SummaryWriter(args.log_dir)
-                writer.add_scalar('train/lr', curr_lr, actual_step)
-                writer.close()
+        scheduler.step()
+        curr_lr = optimizer.param_groups[0]['lr']
+        if (actual_step == 1) or (i + 1) % args.print_freq == 0:
+            writer = SummaryWriter(args.log_dir)
+            writer.add_scalar('train/lr', curr_lr, actual_step)
+            writer.close()
 
     writer.close()
 
 
-def evaluate(val_loader, model, args, epoch):
+def evaluate(val_loader, model, args, epoch, no_adapt_forward=False):
     """Main evaluation loop."""
-    losses = utils.AverageMeter('Val Loss', ':.4e')
-    top1 = utils.AverageMeter('Val Acc@1', ':6.2f')
-    top5 = utils.AverageMeter('Val Acc@5', ':6.2f')
-    top24 = utils.AverageMeter('Val Acc@24', ':6.2f')
+    losses_flm = utils.AverageMeter('Val FLM Loss', ':.4e')
+    losses_no_flm = utils.AverageMeter('Val NO FLM Loss', ':.4e')
+    top1_flm = utils.AverageMeter('Val FLM Acc@1', ':6.2f')
+    top1_no_flm = utils.AverageMeter('Val NO FLM Acc@1', ':6.2f')
+    top5_flm = utils.AverageMeter('Val FLM Acc@5', ':6.2f')
+    top5_no_flm = utils.AverageMeter('Val NO FLM Acc@5', ':6.2f')
+    top24_flm = utils.AverageMeter('Val FLM Acc@24', ':6.2f')
+    top24_no_flm = utils.AverageMeter('Val NO FLM Acc@24', ':6.2f')
+
+    if no_adapt_forward:
+        losses = losses_flm
+        top1 = top1_flm
+        top5 = top5_flm
+        top24 = top24_flm
+    else:
+        losses = losses_no_flm
+        top1 = top1_no_flm
+        top5 = top5_no_flm
+        top24 = top24_no_flm
 
     writer = SummaryWriter(args.log_dir)
-    model.eval()
-
+    if not no_adapt_forward:
+        model.custom_eval(restore_lm=False)
+    else:
+        model.custom_eval(restore_lm=True)
     with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.cuda.amp.autocast(dtype=GLOBAL_DTYPE):
             for i, (images, tokens, caption_len, image_index) in enumerate(val_loader):
                 if torch.cuda.is_available():
                     images = images.cuda(args.gpu, non_blocking=True)
 
-                visual_embs, _, logits, loss = model(images=images,
-                                                     labels=tokens,
-                                                     tensors=None,
-                                                     mode='no_projection')
-
-                acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
-                                                   tokens.detach().cpu().float(),
-                                                   -100, topk=(1, 5, 24))
+                _, _, logits, loss = model(images=images,
+                                           labels=tokens,
+                                           tensors=None,
+                                           mode='no_projection',
+                                           no_adapt_forward=no_adapt_forward)
+                if not no_adapt_forward:
+                    tokens = tokens[:, 0]
+                acc1, acc5, acc24 = utils.accuracy(logits.detach(),
+                                                   tokens.detach(),
+                                                   1, topk=(1, 5, 24))
 
                 top1.update(acc1[0], images.size(0))
                 top5.update(acc5[0], images.size(0))
@@ -543,11 +574,11 @@ def evaluate(val_loader, model, args, epoch):
         top1.all_reduce()
         top5.all_reduce()
         top24.all_reduce()
-
-    writer.add_scalar('val/loss', losses.avg, epoch)
-    writer.add_scalar('val/seq_top1_acc', top1.avg, epoch)
-    writer.add_scalar('val/seq_top5_acc', top5.avg, epoch)
-    writer.add_scalar('val/seq_top24_acc', top24.avg, epoch)
+    tag = 'no_flm' if not no_adapt_forward else 'flm'
+    writer.add_scalar(f'val/{tag}/loss', losses.avg, epoch)
+    writer.add_scalar(f'val/{tag}/seq_top1_acc', top1.avg, epoch)
+    writer.add_scalar(f'val/{tag}/seq_top5_acc', top5.avg, epoch)
+    writer.add_scalar(f'val/{tag}/seq_top24_acc', top24.avg, epoch)
     writer.close()
 
     return losses.avg, (top1.avg, top5.avg, top24.avg)
@@ -556,24 +587,25 @@ def evaluate(val_loader, model, args, epoch):
 def inspect(val_loader, model, args, tokenizer):
     model.eval()
     with torch.no_grad():
-        for i, (images, tokens, caption_len, image_index) in enumerate(val_loader):
-            if torch.cuda.is_available():
-                images = images.cuda(args.gpu, non_blocking=True)
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            for i, (images, tokens, caption_len, image_index) in enumerate(val_loader):
+                if torch.cuda.is_available():
+                    images = images.cuda(args.gpu, non_blocking=True)
 
-            visual_embs, logits, loss = model(images=images,
-                                              labels=tokens,
-                                              tensors=None,
-                                              mode='no_projection')
+                visual_embs, logits, loss = model(images=images,
+                                                  labels=tokens,
+                                                  tensors=None,
+                                                  mode='no_projection')
 
-            acc1, acc5, acc24 = utils.accuracy(logits.detach().cpu().float(),
-                                               tokens.detach().cpu().float(),
-                                               -100, topk=(1, 5, 24))
-            bd = tokenizer.batch_decode(tokens)
-            _, pred = logits.topk(24, -1, True, True)
-            mbd = tokenizer.batch_decode(pred)
-            print(f"Caption: {bd}\n")
-            print(f"Model BOW: {mbd}\n")
-            print(f"Acc@1:{acc1} /Acc@5:{acc5} / Acc@24:{acc24}")
+                acc1, acc5, acc24 = utils.accuracy(logits.detach(),
+                                                   tokens.detach(),
+                                                   1, topk=(1, 5, 24))
+                bd = tokenizer.batch_decode(tokens)
+                _, pred = logits.topk(24, -1, True, True)
+                mbd = tokenizer.batch_decode(pred)
+                print(f"Caption: {bd}\n")
+                print(f"Model BOW: {mbd}\n")
+                print(f"Acc@1:{acc1} /Acc@5:{acc5} / Acc@24:{acc24}")
 
     return
 

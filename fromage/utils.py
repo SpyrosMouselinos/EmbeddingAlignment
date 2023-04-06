@@ -227,7 +227,7 @@ class AverageMeter(object):
         return fmtstr.format(**self.__dict__)
 
 
-def accuracy(output, target, padding, topk=(1,)):
+def accuracy(output, target, padding=1, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
         maxk = max(topk)
@@ -239,9 +239,10 @@ def accuracy(output, target, padding, topk=(1,)):
         # Take topk along the last dimension.
         _, pred = output.topk(maxk, -1, True, True)  # (N, T, topk)
         # Replicate predictions TOPK times #
-        pred = torch.stack([pred] * target.size()[1], dim=1)
-        mask = (target != padding).type(target.dtype)
-        target_expand = target[..., None].expand_as(pred)
+        # if pred.size().__len__() == 2:
+        #     pred = torch.stack([pred] * target.size()[1], dim=1)
+        mask = (target != padding).type(target.dtype).to(device=pred.device)
+        target_expand = target[..., None].expand_as(pred).to(device=pred.device)
         correct = pred.eq(target_expand)
         correct = correct * mask[..., None].expand_as(correct)
 

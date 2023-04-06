@@ -4,6 +4,8 @@ import json
 import torch
 import torch.nn as nn
 import copy
+
+from torch.nn import CrossEntropyLoss
 from transformers import OPTForCausalLM, GPT2Tokenizer
 from transformers import CLIPVisionModel
 from fromage.losses import AsymmetricLossOptimized, RelaxedListMLE
@@ -450,6 +452,14 @@ class FrozenArgs:
 #         return out, output_embeddings, output_logits
 
 
+class DummyIdentity(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, inputs, **kwargs):
+        return [inputs]
+
+
 class LLMGENWrapper(nn.Module):
     def __init__(self, model, tokenizer):
         super().__init__()
@@ -545,20 +555,18 @@ class TLTLModel(nn.Module):
         print("[Step 1]: Restoring the LM...\n")
         self.opt_version = opt_version
         self.lm = OPTForCausalLM.from_pretrained(opt_version)
-        print("[Step 2]: Extracting the Unembed Layer... \n")
-        self.unembed = copy.deepcopy(self.lm.lm_head)
-        print("[Step 3]: Freezing the Unembed Layer... \n")
-        self.unembed.eval()
-        for param in self.unembed.parameters():
+        self.lm.eval()
+        for param in self.lm.parameters():
             param.requires_grad = False
-        self.lm = None
-        del self.lm
-        language_hidden_size = self.unembed.weight.size()[1]
-        self.active_vocab_size = self.unembed.weight.size()[0]
+        language_hidden_size = self.lm.lm_head.weight.size()[1]
+        self.active_vocab_size = self.lm.lm_head.weight.size()[0]
+        self.bos = self.lm.model.decoder.embed_tokens.weight[2].detach().cuda()
+        self.bos.requires_grad = False
         print("[Step 4]: Restoring the VM...\n")
         self.visual_model_name = visual_encoder
         self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder)
         visual_hidden_size = self.visual_model.config.hidden_size
+
         print("[Step 5]: Freezing the VM... \n")
         self.visual_model.eval()
         for param in self.visual_model.parameters():
@@ -566,15 +574,30 @@ class TLTLModel(nn.Module):
 
         embedding_dim = language_hidden_size * self.args.n_visual_tokens
         self.visual_embeddings = nn.Linear(visual_hidden_size, embedding_dim, bias=True)
-
-        self.post_visual_embeddings_normalization = nn.LayerNorm(normalized_shape=embedding_dim,
-                                                                 elementwise_affine=True)
-        self.reduce = nn.Linear(embedding_dim, embedding_dim, bias=True)
         self.gamma_neg = self.args.gamma_neg if self.args.gamma_neg is not None else 4
         self.gamma_pos = self.args.gamma_pos if self.args.gamma_pos is not None else 1
-        # self.loss_fn = AsymmetricLossOptimized(gamma_neg=self.gamma_neg, gamma_pos=self.gamma_pos)
-        self.loss_fn = RelaxedListMLE()
-        self.train()
+        self.loss_fn = AsymmetricLossOptimized(gamma_neg=self.gamma_neg, gamma_pos=self.gamma_pos)
+        self.prompt_registry = {}
+        self.prepare_prompts()
+        self.new_pool = nn.AvgPool2d((16, 1))
+        self.new_drop = nn.Dropout2d(p=0.2)
+
+    def prepare_prompts(self, start_block_idx=-3,
+                        prompts=['Picture of a', 'Image of a', 'This is a', 'Q:What is this? A:This is a', 'A']):
+        self.lm.eval()
+        self.lm.to('cpu')
+        for i, prompt in enumerate(prompts):
+            tokenized_prompt = self.tokenizer(prompt,
+                                              add_special_tokens=True,
+                                              return_tensors="pt").input_ids
+
+            with torch.no_grad():
+                output = self.lm(tokenized_prompt, output_hidden_states=True, use_cache=False).hidden_states[
+                    start_block_idx]
+                # This will go as input to start_block_idx + 1 layer #
+
+                self.prompt_registry[i] = output.detach().cpu()
+        return
 
     def get_visual_embs(self,
                         pixel_values: torch.FloatTensor,
@@ -589,7 +612,8 @@ class TLTLModel(nn.Module):
 
         if 'clip' in self.visual_model_name:
             outputs = self.visual_model(pixel_values)
-            encoder_outputs = outputs.pooler_output
+            encoder_outputs = self.new_pool(outputs.last_hidden_state)
+            encoder_outputs = self.new_drop(encoder_outputs)
         else:
             raise NotImplementedError
 
@@ -598,66 +622,96 @@ class TLTLModel(nn.Module):
 
     def train(self, mode=True):
         super(TLTLModel, self).train(mode=mode)
-        self.unembed.eval()
-        for param in self.unembed.parameters():
-            param.requires_grad = False
         self.visual_model.eval()
+        self.lm.eval()
         for param in self.visual_model.parameters():
             param.requires_grad = False
-        self.visual_embeddings.train()
-        self.post_visual_embeddings_normalization.train()
-
-    def custom_eval(self):
-        self.unembed.eval()
-        for param in self.unembed.parameters():
+        for param in self.lm.parameters():
             param.requires_grad = False
+        self.visual_embeddings.train()
+        for layer in range(0, self.lm.model.decoder.layers.__len__() - 3):
+            self.lm.model.decoder.layers[layer] = DummyIdentity()
+
+
+    def custom_eval(self, restore_lm=True):
         self.visual_model.eval()
         for param in self.visual_model.parameters():
             param.requires_grad = False
         self.visual_embeddings.eval()
-        self.post_visual_embeddings_normalization.eval()
+        if restore_lm:
+            self.lm = OPTForCausalLM.from_pretrained(self.opt_version)
+            self.lm.eval()
+        else:
+            self.lm.eval()
 
     def calc_loss_(self, x, y):
-        batch_size, _ = x.size()
-        sparse_y = torch.zeros(batch_size,
-                               self.active_vocab_size,
-                               device=y.device).scatter_(1, y, torch.ones(batch_size,
-                                                                          self.active_vocab_size, device=y.device))
-        minus_y = -1 * torch.ones(batch_size,
-                                  self.active_vocab_size,
-                                  device=y.device).scatter_(1, torch.randint(low=0, high=self.active_vocab_size,
-                                                                             size=(batch_size, 100), device=y.device),
-                                                            torch.zeros(batch_size,
-                                                                        self.active_vocab_size, device=y.device))
+        batch_size = x.size()[0]
+        seq_len = x.size()[1] if x.size().__len__() == 3 else 1
+        if seq_len == 1:
+            x = x.unsqueeze(1)
+            y = y[:, 0].unsqueeze(1)
+        y = y.unsqueeze(1)  # if x.size().__len__() == 3 else y
+        target_dim = 2  # if x.size().__len__() == 3 else 1
 
-        minus_y *= 1 - sparse_y
-        minus_y += sparse_y
-        minus_y[:, 0] = -1
-        minus_y[:, 1] = -1
-        minus_y[:, 2] = -1
-        loss = self.loss_fn(x, minus_y)
+        zs = torch.zeros(batch_size,
+                         seq_len,
+                         self.active_vocab_size,
+                         device=x.device)
+
+        sparse_y = zs.scatter_(target_dim, y.to(x.device), torch.ones(batch_size,
+                                                         seq_len,
+                                                         self.active_vocab_size, device=x.device))
+
+        sparse_y[:, :, 0] = 0
+        sparse_y[:, :, 1] = 0
+        sparse_y[:, :, 2] = 0
+        loss = self.loss_fn(x, sparse_y)
+        return loss
+
+    def calc_lm_loss_(self, x, y):
+        batch_size, _ = x.size()
+        # Shift so that tokens < n predict n
+        shift_logits = x[..., :-1, :].contiguous()
+        shift_labels = y[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss()
+        loss = loss_fct(shift_logits.view(-1, self.active_vocab_size), shift_labels.view(-1))
         return loss
 
     def forward(self,
                 images: torch.FloatTensor,
                 labels: torch.LongTensor,
                 tensors=None,
-                mode: str = 'no_projection'):
-
+                mode: str = 'no_projection',
+                no_adapt_forward=False
+                ):
+        if no_adapt_forward:
+            return self.no_adapt_forward(images=images, labels=labels, tensors=tensors, mode=mode)
         ### Part 1: Get the visual representation or tensor ###
         if tensors is None:
             visual_embs = self.get_visual_embs(images, mode)
-            batch_size, _ = visual_embs.shape  # vis_seq_len = n_visual_tokens
+            batch_size = visual_embs.shape[0]  # vis_seq_len = n_visual_tokens
         else:
             visual_embs = tensors
-            batch_size, _ = visual_embs.shape
+            batch_size = visual_embs.shape[0]
 
         ### Part 2: Project it and transform it ###
         visual_embs = self.visual_embeddings(visual_embs)
 
+        prompt_idxs = torch.randint(low=0, high=self.prompt_registry.__len__(), size=(1,)).repeat(batch_size)
+        prompts = []
+        for prompt_idx in prompt_idxs:
+            prompts.append(self.prompt_registry[prompt_idx.item()].to(device=visual_embs.device))
+        if visual_embs.shape.__len__() == 2:
+            prompts = torch.cat([visual_embs.unsqueeze(1), torch.cat(prompts, dim=0)], dim=1)
+        elif visual_embs.shape.__len__() == 3:
+            prompts = torch.cat([visual_embs, torch.cat(prompts, dim=0)], dim=1)
 
-        ### Part 4: Use the Unembedding Layer to translate into the logits ###
-        logits = self.unembed(visual_embs)
+        dec_l_11 = self.lm.model.decoder.layers[-2](prompts)[0]
+        dec_l_12 = self.lm.model.decoder.layers[-1](dec_l_11)[0]
+        final_layer_h = self.lm.model.decoder.final_layer_norm(dec_l_12)
+
+        logits = self.lm.lm_head(final_layer_h)[:, -1, :]
 
         ### Part 5: Calculate the Loss ###
         if labels is not None:
@@ -666,6 +720,43 @@ class TLTLModel(nn.Module):
         else:
             loss = None
         return visual_embs, None, logits, loss
+
+    def no_adapt_forward(self,
+                         images: torch.FloatTensor,
+                         labels: torch.LongTensor,
+                         tensors=None,
+                         mode: str = 'no_projection'):
+
+        if tensors is None:
+            visual_embs = self.get_visual_embs(images, mode)
+            batch_size = visual_embs.shape[0]  # vis_seq_len = n_visual_tokens
+        else:
+            visual_embs = tensors
+            batch_size = visual_embs.shape[0]
+
+        visual_embs = self.visual_embeddings(visual_embs)
+        prefix = ' In this picture one can see a'
+        prefix = self.tokenizer(prefix,
+                                add_special_tokens=True,
+                                return_tensors="pt").input_ids
+
+        prefix = prefix.to(visual_embs.device).repeat(batch_size, 1)
+        for i in range(0, labels.size()[1]):
+            outputs_at_9 = self.lm(prefix, output_hidden_states=True, use_cache=False).hidden_states[9]
+            if visual_embs.shape.__len__() == 2:
+                prompts = torch.cat([visual_embs.unsqueeze(1), outputs_at_9], dim=1)
+            elif visual_embs.shape.__len__() == 3:
+                prompts = torch.cat([visual_embs, outputs_at_9], dim=1)
+
+            dec_l_11 = self.lm.model.decoder.layers[-2](prompts)[0]
+            dec_l_12 = self.lm.model.decoder.layers[-1](dec_l_11)[0]
+            final_layer_h = self.lm.model.decoder.final_layer_norm(dec_l_12)
+            logits = self.lm.lm_head(final_layer_h)
+            next_token_id = torch.argmax(logits[:, -1, :], dim=1)
+            prefix = torch.cat([prefix, next_token_id.to(visual_embs.device).unsqueeze(1)], dim=1)
+
+        loss = self.calc_loss_(logits[:, -labels.size()[1]:, :], labels)
+        return None, None, logits[:, -labels.size()[1]:, :], loss
 
 
 def load_tltl(model_dir: str) -> TLTLModel:
